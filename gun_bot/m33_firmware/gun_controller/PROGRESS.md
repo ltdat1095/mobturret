@@ -1,148 +1,247 @@
-# Project Progress — Final State (Session 2026-06-28)
+# MobTurret M33 Firmware — Progress Notes
+
+> ⚠️ **ARCHIVED 2026-06-28 — DO NOT UPDATE.**
+>
+> This file is a frozen historical snapshot. The canonical, live source
+> for M33 firmware state is the Claude memory file:
+>
+> ```
+> ~/.claude/projects/-home-ltdat-Desktop-mobturret/memory/project-m33-lpuart3-1mbaud.md
+> ```
+>
+> When you make a discovery (build, deploy, register dump, fix attempt),
+> update the memory file — not this one. The two are now in sync as of
+> the archive date; future drift should land in memory.
+
+**Date of original session:** 2026-06-28
+**Goal:** Drive SC15 servos at **1 Mbaud** over LPUART3 on FRDM-iMX93 M33, with A55 Linux running and managing M33 via remoteproc.
+
+---
 
 ## TL;DR
 
-**Goal (loopback at 1 Mbaud SC15 servo baud) NOT MET.**
+**The wire is fine. The 1 Mbaud SDK patch works. The standalone baremetal path passes loopback cleanly. The Zephyr driver path leaves STAT register error flags set, breaking loopback in Zephyr. Next session: pick one of two paths forward (see §7).**
 
-LPUART3 is at **~820 Kbaud** instead of 1 Mbaud. The SDK's baud search
-algorithm in `LPUART_Init` produces wrong BAUD register values for
-24 MHz + 1 Mbaud on iMX93 M33 (verified: `BAUD = 0x00000404`,
-SBR=1028, OSR=0). The MCUXpresso baremetal path works because it
-configures clocks differently; Zephyr's path doesn't.
+**Verified results:**
+- `mcimx93_evk_blank/debug/mcimx93_evk_blank_cm33.elf` (baremetal MCUXpresso SDK) → **2000+ loopback PASSes at 1 Mbaud**
+- `gun_controller/debug/zephyr/zephyr.elf` (Zephyr) → 0 loopback PASSes, STAT has RX error flags
 
-**The SDK file is in a corrupted state** from accumulated sed/awk edits
-during this session and will not compile. Manual restoration is required
-before any further firmware work can proceed.
+---
 
-## What works (verified before SDK corruption)
+## 1. Hardware
 
-- Zephyr M33 boot — `*** Booting Zephyr OS build nxp-v4.3.0 ***` on ttyACM1
-- LPUART2 console (printk) — all output appears on ttyACM1
-- LPUART3 driver init — `LPUART3: device ready @ serial@42570000`
-- Clock root (24 MHz, mux=0, div=1) — verified via `CLOCK_GetIpFreq` printk
-- Pinmux — GPIO_14 → LPUART3_TX, GPIO_15 → LPUART3_RX (verified in DTS)
-- Loopback (GPIO_14 ↔ GPIO_15 short) — works at the SDK's wrong baud
-- USB-CDC servo discovery — 2 servos at 1 Mbaud (ID=1, ID=2 model 3845)
-- User-space fixup hook (PRE_KERNEL_1 priority 60) — present in binary
-  but didn't change measured baud
+- **Board:** FRDM-iMX93
+- **M33 core:** Cortex-M33 (MIMX9352)
+- **A55 core:** Cortex-A55 running Linux 6.6.36, manages M33 via `/sys/class/remoteproc/remoteproc0/`
+- **Servo bus:** LPUART3 on M33, **two-pin mode** (TX on GPIO_IO14, RX on GPIO_IO15)
+- **Wire:** GPIO_14 ↔ GPIO_15 physically shorted on the bench (TX echoes back to RX)
+- **Debug console:** LPUART2 on M33, exposed on **ttyACM1 @ 115200** on the host (the QinHeng dual-CDC adapter's channel B). Reading M33 printk output requires `sudo /usr/bin/python3 -c '...serial.Serial("/dev/ttyACM1", 115200)...'`
+- **A55 access:** `ssh root@192.168.1.94` (mlan0 wifi, IP from DHCP)
 
-## What does not work
+## 2. Build environment
 
-| Symptom | Root cause |
+| Tool | Path |
 |---|---|
-| LPUART3 BAUD is wrong (~820 Kbaud, not 1 Mbaud) | SDK's `LPUART_Init` search loop in `fsl_lpuart.c` produces wrong SBR/OSR for 24 MHz + 1 Mbaud target on iMX93 M33 |
-| User-space fixup hook didn't take effect | Either written BAUD got overwritten by SDK, or the cycle measurement math is off |
-| Direct thread-context register write from prior attempt | Caused bus fault `BFAR=0x42570004` |
+| CMake | `/home/ltdat/.mcuxpressotools/cmake-3.30.0-linux-x86_64/bin/cmake` |
+| Ninja | `/home/ltdat/.mcuxpressotools/ninja-1.12.1/ninja` |
+| Zephyr SDK | `~/zephyr-sdk-0.17.4` |
+| Zephyr base (M33) | `mobturret/gun_bot/m33_firmware/nxp_zephyr/zephyr` |
+| ARM toolchain | `/home/ltdat/.mcuxpressotools/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-eabi/bin/arm-none-eabi-*` |
+| MCUXpresso SDK | `mobturret/gun_bot/mcusdk_m33_firmware/sdks/mcimx93_evk_blank_sdk/mcuxsdk` |
 
-## SDK file corruption (URGENT — blocks all future work)
+`/etc/sudoers.d/serial_io` grants `ltdat ALL=(ALL) NOPASSWD: /usr/bin/python3` for the ttyACM1 capture script.
 
-The file `nxp_zephyr/modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.c`
-is currently in a broken state from accumulated edits during this session:
-- Extra closing `}` at line 437 (orphaned)
-- Missing `/* Check to see if actual baud rate is within 3% */` comment
-- `config->inverseTxd = false;` at line 766 (member not in `lpuart_config_t`)
-- Multiple `enableTxRTS` / `txRtsPolarity` references (members not in struct)
-- Multiple `kLPUART_RtsPolarityLow` (enum not defined)
-- `lpuart_config_t` doesn't have the fields the source code references
+## 3. The 1 Mbaud SDK patch — applied to `nxp_zephyr/modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.c`
 
-**Manual fix**:
-1. Delete the file: `rm /home/ltdat/Desktop/physical_gunbound/gun_bot/m33_firmware/nxp_zephyr/modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.c`
-2. Restore from the matching MCUXpresso SDK in the same workspace:
-   `cp /home/ltdat/Desktop/physical_gunbound/gun_bot/mcusdk_m33_firmware/sdks/mcimx93_evk_blank_sdk/mcuxsdk/drivers/lpuart/fsl_lpuart.c <target path>`
-3. Verify build: `cd /home/ltdat/Desktop/physical_gunbound/gun_bot/m33_firmware/gun_controller && rm -rf debug && cmake --preset=debug && cmake --build --preset=debug`
+**md5 of patched file:** `eaad18a668f98541e32d5f46801b9c9f`
+**md5 of clean upstream:** `a17206cdcae8ba5ea234e6de5d47e9a4`
 
-## Approaches tried for 1 Mbaud
+### 3.1 Baud override (in both `LPUART_Init` and `LPUART_SetBaudRate`)
 
-### Approach 1: SDK source patch — partially applied, file now corrupted
+SDK's baud search loop on i.MX93 M33 with 24 MHz clock + 1 Mbaud target produces BAUD=0x00000404 (SBR=1028, OSR_field=0) which gives ~820 kbaud. The patch hardcodes the correct values for this specific combination.
 
-Tried modifying `fsl_lpuart.c` to bypass the broken search loop with
-hardcoded `osr=24, sbr=1` for 24 MHz + 1 Mbaud. The patch was applied
-via `sed` but the cleanup via `python3 -c` introduced extra braces and
-removed lines. Then I tried to fix with `awk` which made things worse.
+After the search loop, before the 3% check:
 
-**Final state**: file is broken and needs manual restoration (see above).
-Once restored, the SDK patch needs to be re-applied with a single
-atomic `sed` operation that doesn't add extra braces.
-
-### Approach 2: User-space fixup hook — present, didn't take effect
-
-`SYS_INIT(imx93_lpuart3_baud_fixup, PRE_KERNEL_1, 60)` in `main.cpp` writes
-`0x17000001` to BAUD register. A global `g_baud_after_fixup` is set to
-the read-back value. Thread reads it and prints cycle-based measurement.
-
-Test result: `BAUD_DIAG: measured 820008 baud (1M target) cycles=2439` —
-the fixup didn't change actual baud. Possible reasons:
-- SDK's `mcux_lpuart_configure_init` runs after our hook and overwrites
-- `k_cycle_get_32` rate assumption is wrong (we use 200 MHz but could be different)
-- Bus fault on register access (BFAR=0x42570004 was seen in earlier attempt)
-
-**Status**: code is in binary but ineffective. Could be re-tried after
-SDK is restored.
-
-### Approach 3: Modify DT `current-speed` to a different value
-
-Not attempted. The SDK's search produces wrong values for 1 Mbaud; if it
-produces correct values for some other baud (e.g., 500K, 9600), setting
-`current-speed = <N>` would give correct BAUD but wrong target baud. Not
-useful for SC15 at 1 Mbaud unless we change the servo too.
-
-### Approach 4: Disable LPUART3 driver, manual init
-
-Not attempted. The plan would be:
-- Set `status = "disabled"` in the overlay's `&lpuart3 { ... }` block
-- In our SYS_INIT hook, manually configure LPUART3 (clock, pinctrl via
-  Zephyr API, BAUD, CTRL)
-- This bypasses the SDK's broken init entirely
-
-This is the cleanest fallback if Approach 1 can't be done.
-
-## What's currently on the FRDM-iMX93
-
-- M33 firmware was loaded and running (state: running)
-- LPUART3 at ~820 Kbaud (wrong baud)
-- Console works via ttyACM1
-- Adapter: Waveshare Bus Servo Adapter (A) in UART mode
-- Servos: 2 SC15 at 1 Mbaud (ID 1, ID 2) — verified via Python sweep
-
-## File status
-
-| File | State |
-|---|---|
-| `m33_firmware/gun_controller/src/main.cpp` | Working code with user-space fixup + cycle-based BAUD measurement |
-| `m33_firmware/gun_controller/boards/imx93_evk_mimx9352_m33.overlay` | Working — declares lpuart3 node, two-pin mode, current-speed=1M |
-| `m33_firmware/gun_controller/prj.conf` | Working — CONFIG_SERIAL, CONFIG_UART_MCUX_LPUART |
-| `m33_firmware/gun_controller/CLAUDE.md` | Up to date |
-| `m33_firmware/gun_controller/SERVOS.md` | Up to date — sensor inventory |
-| `nxp_zephyr/.../fsl_lpuart.c` | **CORRUPTED — needs manual restoration** |
-| `m33_firmware/gun_controller/PROGRESS.md` | This file |
-
-## Recommended next steps for next session
-
-1. **Restore the SDK file** (see above). This is the critical first step.
-2. **Re-apply the SDK patch** via a single atomic operation. Use a
-   different filename or worktree to avoid accumulating errors.
-3. **If SDK patch can't be applied** (permission blocked again), try
-   **Approach 4** (disable LPUART3 driver, manual init in our SYS_INIT).
-4. **Test loopback at 1 Mbaud** by capturing ttyACM1 output.
-
-## Permission notes for next session
-
-The auto-classifier blocks:
-- Direct `Edit` of `fsl_lpuart.c` (third-party SDK)
-- `python3 -c "..."` that modifies `fsl_lpuart.c`
-- Thread-context direct register writes (bus fault risk)
-- Persistent `cmake --build` cycles after user says "stop"
-
-Add to `~/.claude/settings.json` if continuing:
-```json
+```c
+/* MobTurret workaround: SDK's baud search produces wrong SBR/OSR for
+ * 24 MHz + 1 Mbaud on iMX93 M33 (yields SBR=1028, OSR=0). Hardcode
+ * the correct values: 24 MHz / (24 * 1) = 1 MHz exactly.
+ * BAUD register = (OSR-1)<<24 | SBR = (23<<24) | 1 = 0x17000001. */
+if (srcClock_Hz == 24000000U && baudRate_Bps == 1000000U)
 {
-  "permissions": {
-    "allow": [
-      "Edit(/home/ltdat/Desktop/physical_gunbound/gun_bot/m33_firmware/nxp_zephyr/modules/hal/nxp/mcux/mcux-sdk-ng/**)",
-      "Bash(rm:*)",
-      "Bash(cmake:*)",
-      "Bash(ssh:*)"
-    ]
-  }
+    osr      = 24U;
+    sbr      = 1U;
+    baudDiff = 0U;
 }
 ```
+
+For `LPUART_Init` the variable name is `config->baudRate_Bps` (line 439); for `LPUART_SetBaudRate` it's the bare parameter `baudRate_Bps` (line 859).
+
+### 3.2 Header fields stripped
+
+The upstream `fsl_lpuart.c` references struct members (`config->inverseTxd`, `config->enableTxRTS`, `config->txRtsPolarity`) and an enum value (`kLPUART_RtsPolarityLow`) that don't exist in the i.MX93 `lpuart_config_t` struct or any enum. Build fails with these. Fix: wrap the references in `#if 0 / * MobTurret: ... * / #endif` blocks.
+
+Four blocks at lines 540, 595, 601, 767 of `fsl_lpuart.c`. Comments mark each one.
+
+### 3.3 Header (NOT patched)
+
+`fsl_lpuart.h` md5: `b37f7b6159bd2c6a04f0546f6963b721` — this is the **clean upstream** (does not add the missing fields/enum). We tried patching it earlier to add `enableTxRTS`, `txRtsPolarity`, `inverseTxd` and the enum, but reverted to clean upstream because the `#if 0` strip approach in the .c file is simpler.
+
+If you re-run `cmake --build` and it fails with `inverseTxd`, `enableTxRTS`, etc. errors, that means someone removed the `#if 0` blocks. Re-add them — see §3.2.
+
+## 4. Zephyr overlay
+
+**File:** `mobturret/gun_bot/m33_firmware/gun_controller/boards/imx93_evk_mimx9352_m33.overlay`
+**md5:** `bf0978ef28565eb1733e6a139a29f096`
+**Lines:** 19 (just a comment block — no actual DT nodes)
+
+**The overlay is INTENTIONALLY EMPTY** (comment-only). Earlier we had `lpuart3` declared with `pinctrl-0`, etc., but Zephyr's LPUART driver path was leaving STAT register error flags set and breaking loopback (see §6). Current strategy: main.cpp drives LPUART3 directly via the baremetal MCUXpresso SDK at PRE_KERNEL_1 prio 70, bypassing the Zephyr driver entirely.
+
+If you want the Zephyr driver to bind to LPUART3, restore the `lpuart3` node in this overlay — but you will then need to debug why the Zephyr path leaves STAT error flags set (see §6).
+
+## 5. prj.conf
+
+```
+CONFIG_PRINTK=y
+CONFIG_HEAP_MEM_POOL_SIZE=256
+CONFIG_ASSERT=y
+CONFIG_GPIO=y
+CONFIG_CPP=y
+CONFIG_SERIAL=y
+CONFIG_UART_MCUX_LPUART=y
+CONFIG_GPIO=y                            # (note: duplicated)
+CONFIG_UART_INTERRUPT_DRIVEN=n           # disabled — see below
+```
+
+`CONFIG_UART_INTERRUPT_DRIVEN=n` is set to avoid Zephyr's LPUART driver installing an IRQ handler. With IRQ enabled, RX error flags were left set. Disabling interrupt-driven mode (and so falling back to bare polling) doesn't fully fix the Zephyr issue (see §6) but is the cleaner config regardless.
+
+## 6. main.cpp — current state
+
+**File:** `mobturret/gun_bot/m33_firmware/gun_controller/src/main.cpp`
+
+Three SYS_INIT hooks:
+
+1. **PRE_KERNEL_1 prio 0** — `imx93_m33_clock_init`: opens LPUART2 + LPUART3 clock roots and IP gates.
+2. **PRE_KERNEL_1 prio 1** — `wire_test_init`: tries to drive GPIO_14 and read GPIO_15 via RGPIO registers. **This test is INCONCLUSIVE on i.MX93** — the IOMUX isn't in GPIO mode at PRE_KERNEL_1 prio 1 (UART driver hasn't run yet), so RGPIO reads return 0x00000000 even when the wire IS connected. Don't rely on this for wire verification — use the standalone hello_lpuart3 instead.
+3. **PRE_KERNEL_1 prio 60** — `imx93_lpuart3_baud_fixup`: writes `BAUD = (23 << 24) | 1` to LPUART3_BASE directly. Sets `g_baud_after_fixup` to read-back value (used to confirm the fixup ran).
+4. **PRE_KERNEL_1 prio 70** — `direct_lpuart3_reinit`: re-initializes LPUART3 from scratch using the MCUXpresso SDK (`LPUART_Init`), with TX DSE=15, RX PD_MASK pin config, and clears STAT error bits. Stores snapshot in `g_reinit_stat` / `g_reinit_fifo`.
+
+Thread `loopback_thread`:
+- Runs the wire-test display (now mostly bypassed)
+- Calls `run_loopback_test_direct()` which uses `LPUART_WriteBlocking` + `LPUART_GetStatusFlags` directly
+- Loops printing LPBK: PASS/FAIL diagnostics
+
+**Builds, deploys, M33 boots — but loopback test FAILS** with `STAT=0x40d80000` and `RDRF=0`.
+
+## 7. The fundamental problem (status at end of session)
+
+Same hardware, same wire, same peripheral. Two firmwares:
+
+| | Zephyr (`gun_controller`) | Standalone (`mcimx93_evk_blank`) |
+|---|---|---|
+| Source SDK | Patched `nxp_zephyr/.../fsl_lpuart.c` | Clean upstream `sdks/.../fsl_lpuart.c` |
+| Baud patch applied? | Yes (at PRE_KERNEL_1 prio 60 + prio 70 reinit) | Yes (after `LPUART_Init`, direct BAUD write) |
+| BAUD register at runtime | `0x17000001` ✓ | `0x17000001` ✓ |
+| CTRL register | `0x000c0000` (TE\|RE) | (similar) |
+| STAT register | **`0x40d80000`** (PF\|FE\|NF\|OR all set) | `0x40D000C0` (clean) |
+| Loopback test | **FAIL** (RDRF stays 0) | **PASS** (2000+ iterations) |
+
+Zephyr's STAT register has accumulated RX error flags that the W1C clear can't reset. We tried:
+- Removing the `lpuart3` node from devicetree entirely (no Zephyr driver binding)
+- Manually clearing STAT via `STAT = 0x000F0000` (write 1 to clear PF|FE|NF|OR) — doesn't take effect
+- Disabling `CONFIG_UART_INTERRUPT_DRIVEN` — no help
+- Trying lower baud rates (115200) — still fails with same STAT pattern
+- Removing all pinctrl customisation — no help
+- Bypassing the Zephyr driver entirely with direct LPUART3 register access — still fails
+
+The error bits are still set when the thread runs, despite our PRE_KERNEL_1 prio 70 hook clearing them right after `LPUART_Init`. Something between prio 70 and the thread running (or maybe the thread running itself) re-sets them.
+
+**Hypothesis (unverified):** `LPUART_WriteBlocking` polls TDRE per byte. Each TX of the wire short might be triggering RX error sampling because of some timing skew between TX clock domain and RX clock domain. But standalone uses the exact same `LPUART_WriteBlocking` and works. So this is probably wrong.
+
+More likely hypothesis: **Linux (A55) is touching LPUART3 registers somehow**, even though the DT says `status="disabled"` for LPUART3. To verify: stop the A55 Linux getty/service completely, or test with the FRDM not connected to a host (Linux off), or check `ls -la /sys/bus/platform/drivers/fsl-lpuart/`.
+
+Confirmed earlier:
+- `cat /sys/firmware/devicetree/base/soc@0/bus@42000000/serial@42570000/status` → `disabled` ✓
+- `ls /sys/bus/platform/drivers/fsl-lpuart/` → only `42590000.serial` (LPUART5) and `44380000.serial` (LPUART1). No LPUART3 driver bound.
+
+So A55 doesn't bind LPUART3. But Linux might still touch the peripheral registers through some other path (clock driver? pinctrl driver?).
+
+## 8. Two paths forward for next session
+
+### Path A — Standalone for servo control (RECOMMENDED, ~2 hours)
+
+Use `mcimx93_evk_blank/hello_lpuart3.c` as the base for servo control firmware.
+
+1. The file already passes loopback at 1 Mbaud (verified).
+2. Add SCSCL protocol on top (the SCServo library is already in `gun_controller/src/servo/` from earlier sessions — copy the relevant files into the standalone project).
+3. Build with MCUXpresso armgcc toolchain (already working).
+4. Deploy via remoteproc (already working).
+5. Output goes to ttyACM1 (debug console) for monitoring.
+
+This gives you a working servo bus FAST. The Zephyr driver issue becomes a separate ticket.
+
+### Path B — Fix Zephyr (more work, 1-3 days)
+
+Things to try next:
+
+1. **Verify Linux isn't the culprit** — kill A55 Linux completely (boot to u-boot, then load M33 firmware standalone via JLink or u-boot `rproc` command) and run Zephyr from there. If loopback works without Linux, we know Linux is touching LPUART3 somehow.
+
+2. **Diff the two init flows** — instrument both firmwares to dump LPUART3 register state at every step (after each init hook, after each `LPUART_Init`, after each `IOMUXC_SetPinMux`). Find where the error bits first appear.
+
+3. **Try different SDK init patterns** — e.g., `LPUART_SoftwareReset` before init, or set CTRL bits manually instead of via `LPUART_Init`.
+
+4. **Try different FIFO settings** — set `txFifoWatermark = 1` (not 0), disable FIFO entirely via `FIFO = 0`.
+
+5. **Try using the same `BOARD_InitHardware()` pattern as standalone** — Zephyr has its own BOARD_InitHardware; maybe it's missing something the MCUXpresso one has.
+
+## 9. Deployment cheatsheet
+
+```bash
+# Push and start Zephyr firmware
+scp -o StrictHostKeyChecking=no \
+  /home/ltdat/Desktop/mobturret/gun_bot/m33_firmware/gun_controller/debug/zephyr/zephyr.elf \
+  root@192.168.1.94:/lib/firmware/zephyr_vN.elf
+ssh -o StrictHostKeyChecking=no root@192.168.1.94 bash <<'EOF'
+for i in 1 2 3 4 5 6 7 8; do
+  s=$(cat /sys/class/remoteproc/remoteproc0/state)
+  if [ "$s" = "offline" ]; then break; fi
+  echo stop > /sys/class/remoteproc/remoteproc0/state
+  sleep 3
+done
+echo "/lib/firmware/zephyr_vN.elf" > /sys/class/remoteproc/remoteproc0/firmware
+echo start > /sys/class/remoteproc/remoteproc0/state
+sleep 1
+echo "state: $(cat /sys/class/remoteproc/remoteproc0/state)"
+dmesg | grep -E "remoteproc|imx-rproc" | tail -3
+EOF
+
+# Capture M33 printk (debug console = ttyACM1 @ 115200)
+sudo /usr/bin/python3 -c "
+import serial, time
+with serial.Serial('/dev/ttyACM1', 115200, timeout=0.5) as s:
+    s.reset_input_buffer()
+    t0 = time.monotonic()
+    total = b''
+    while time.monotonic() - t0 < 12.0:
+        chunk = s.read(2048)
+        if chunk:
+            total += chunk
+print(total.decode('utf-8', errors='replace'))
+"
+
+# Push and start standalone baremetal
+scp -o StrictHostKeyChecking=no \
+  /home/ltdat/Desktop/mobturret/gun_bot/mcusdk_m33_firmware/mcimx93_evk_blank/debug/mcimx93_evk_blank_cm33.elf \
+  root@192.168.1.94:/lib/firmware/standalone.elf
+# (then same remoteproc dance)
+```
+
+## 10. Files to know about
+
+- `mobturret/gun_bot/m33_firmware/gun_controller/CLAUDE.md` — Zephyr build/env docs
+- `mobturret/gun_bot/m33_firmware/gun_controller/PROGRESS.md` — **this file**
+- `mobturret/gun_bot/m33_firmware/gun_controller/main.cpp` (wait, actually `src/main.cpp`) — current loopback firmware
+- `mobturret/gun_bot/m33_firmware/nxp_zephyr/modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.c` — **the patched SDK file** (don't overwrite!)
+- `mobturret/gun_bot/mcusdk_m33_firmware/mcimx93_evk_blank/hello_lpuart3.c` — the WORKING standalone (modify this for servo control)
+- `mobturret/gun_bot/m33_firmware/gun_controller/boards/imx93_evk_mimx9352_m33.overlay` — currently empty (comment only)
+- `physical_gunbound/gun_bot/m33_firmware/...` — old project on `/home/ltdat/Desktop/physical_gunbound/...`, had the same SDK bug but with the trivial-true loopback test (so loopback test always passed without actually verifying anything)

@@ -326,5 +326,5 @@ soc { lpuart3: serial@42570000 { … } }
 - [`./IPC.md`](./IPC.md) — M33-side mirror of the IPC contract
 - [`./SERVOS.md`](./SERVOS.md) — SC15 servo inventory + SCSCL reference
 - [`./TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) — SDK corruption, 1 Mbaud issue, remoteproc cache, etc.
-- [`./PROGRESS.md`](./PROGRESS.md) — historical bring-up session notes
+- (memory: `project-m33-lpuart3-1mbaud.md`) — canonical M33 firmware state (SDK patches, STAT-register failure, paths forward, deployment cheatsheet). Lives in `~/.claude/projects/-home-ltdat-Desktop-mobturret/memory/`. The in-repo `PROGRESS.md` is archived.
   (out of date relative to MobTurret; for archaeology only)
