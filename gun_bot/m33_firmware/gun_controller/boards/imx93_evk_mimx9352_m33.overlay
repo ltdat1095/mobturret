@@ -1,0 +1,50 @@
+/*
+ * Enable LPUART3 for servo comms on imx93_evk/mimx9352/m33 (M33 core).
+ *
+ * LPUART3 base for M33 non-secure view = 0x42570000
+ * IRQ = 68 (NVIC, ARMv8-M)
+ * Clock root = Lpuart3, sourced from Osc24M with div=1 by the Zephyr clock driver
+ * Pinmux: GPIO_IO14 -> LPUART3_TX, GPIO_IO15 -> LPUART3_RX
+ *
+ * Note: the pinctrl container lives at /soc/iomuxc@443c0000/pinctrl (per
+ * nxp_imx93_m33.dtsi), so we extend it via &pinctrl rather than creating a
+ * new root-level pinctrl node.
+ *
+ * Two-pin mode with external short: SC15 servos use a single-wire
+ * half-duplex bus, but the M33's LPUART3 single-wire mode (LOOPS|RSRC)
+ * hangs uart_poll_out on this iMX93 instance. Workaround: use two-pin
+ * mode and short GPIO_14 (TX) and GPIO_15 (RX) externally to the
+ * adapter's single D pin. RX will see local TX echo plus servo responses;
+ * main.cpp filters the echo.
+ */
+
+/ {
+	soc {
+		lpuart3: serial@42570000 {
+			compatible = "nxp,imx-lpuart", "nxp,lpuart";
+			reg = <0x42570000 DT_SIZE_K(64)>;
+			interrupts = <68 3>;
+			clocks = <&ccm IMX_CCM_LPUART3_CLK 0x6c 24>;
+			status = "disabled";
+		};
+	};
+};
+
+&pinctrl {
+	uart3_default: uart3_default {
+		group0 {
+			pinmux = <&iomuxc1_gpio_io14_lpuart_tx_lpuart3_tx>,
+				 <&iomuxc1_gpio_io15_lpuart_rx_lpuart3_rx>;
+			bias-pull-up;
+			slew-rate = "slightly_fast";
+			drive-strength = "x5";
+		};
+	};
+};
+
+&lpuart3 {
+	status = "okay";
+	current-speed = <1000000>;
+	pinctrl-0 = <&uart3_default>;
+	pinctrl-names = "default";
+};

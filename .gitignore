@@ -1,0 +1,149 @@
+# ============================================================================
+# MobTurret .gitignore
+# ============================================================================
+#
+# Two principles:
+#  1. Vendored upstream source trees are NOT in this repo. They live on
+#     disk for the build to work, but git tracks only the wiring.
+#  2. Generated artifacts are never committed. They're reproducible from
+#     the source + build commands in each subproject's CLAUDE.md.
+#
+# Sections:
+#   A. Vendored upstream source trees
+#   B. Build outputs (per-language)
+#   C. Editors / IDEs
+#   D. OS noise
+#   E. Secrets (NEVER commit)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# A. Vendored upstream source trees (fetch separately — see CLAUDE.md)
+# ----------------------------------------------------------------------------
+
+# NXP downstream Zephyr fork (nxp-v4.3.0). Cloned from
+# https://github.com/nxp-zephyr/zephyr at branch nxp-v4.3.0.
+gun_bot/m33_firmware/nxp_zephyr/
+
+# NXP MCUXpresso SDK bundle for the i.MX93 EVK. Downloaded as a zip from
+# NXP's MCUXpresso SDK Builder.
+gun_bot/mcusdk_m33_firmware/
+
+# Broken external symlink left over from the upstream physical_gunbound
+# repo — points outside this tree and is meaningless on a fresh clone.
+gun_bot/m33_firmware/gun_controller/__repo__
+
+
+# ----------------------------------------------------------------------------
+# B. Build outputs (per-language)
+# ----------------------------------------------------------------------------
+
+# --- C / C++ / Zephyr / MCUXpresso ---
+**/debug/
+**/release/
+**/build/
+**/install/
+**/log/
+**/cmake-build-*/
+# Zephyr / SDK specific
+**/zephyr/zephyr.elf
+**/zephyr/zephyr.bin
+**/zephyr/zephyr.map
+**/zephyr/.config
+**/zephyr/include/generated/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/cmake_install.cmake
+**/Makefile
+**/compile_commands.json
+# Generic C/C++ object outputs
+**/*.o
+**/*.a
+**/*.so
+**/*.d
+
+# --- ROS2 (colcon) ---
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# --- Go ---
+bin/
+*.exe
+*.test
+*.out
+vendor/
+
+# --- Flutter / Dart ---
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter-version
+coverage/
+
+# --- Python (used by SCServo_Linux + STServo_Python + future scripts) ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+venv/
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- Node (used if/when AWS CDK / SAM tooling lands) ---
+node_modules/
+.npm/
+.eslintcache
+
+
+# ----------------------------------------------------------------------------
+# C. Editors / IDEs
+# ----------------------------------------------------------------------------
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.iml
+.project
+.classpath
+.settings/
+
+# Project-local VSCode settings are tracked — override globally per dev.
+
+
+# ----------------------------------------------------------------------------
+# D. OS noise
+# ----------------------------------------------------------------------------
+
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+
+# ----------------------------------------------------------------------------
+# E. Secrets — NEVER commit
+# ----------------------------------------------------------------------------
+#
+# .env.example is committed (documents the schema); .env is not.
+# Device certs, AWS keys, FCM tokens never go in this repo.
+
+.env
+.env.local
+.env.*.local
+.env.production
+*.pem
+*.key
+*.p12
+secrets/
+credentials.json
+service-account*.json

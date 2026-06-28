@@ -1,0 +1,21 @@
+sample:
+  description: Control a NERF-style blaster using SC15 serial servos via LPUART3
+  name: SC15 Servo NERF Blaster Controller
+tests:
+  sample.gun_controller:
+    tags:
+      - kernel
+      - threads
+      - uart
+      - servo
+    integration_platforms:
+      - imx93_evk/mimx9352/m33
+    depends_on: gpio uart
+    harness: console
+    harness_config:
+      type: multi_line
+      ordered: false
+      regex:
+        - "LPUART3: device ready"
+        - "LPUART3: Sent sync byte 0xFF"
+        - "LPUART3: Sent 7 bytes, waiting for response"

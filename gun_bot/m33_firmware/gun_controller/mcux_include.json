@@ -1,0 +1,35 @@
+{
+  "version": 7,
+  "cmakeMinimumRequired": {
+    "major": 3
+  },
+  "configurePresets": [
+    {
+      "name": "debug-env",
+      "displayName": "debug-env",
+      "hidden": true,
+      "environment": {
+        "ZEPHYR_BASE": "/home/ltdat/Desktop/physical_gunbound/gun_bot/m33_firmware/nxp_zephyr/zephyr",
+        "MCUX_VENV_PATH": "/home/ltdat/.mcuxpressotools/.mcux-venv-3.12/bin",
+        "ZEPHYR_SDK_INSTALL_DIR": "/home/ltdat/zephyr-sdk-0.17.4",
+        "PATH": "$env{MCUX_VENV_PATH}${pathListSep}$penv{PATH}",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "cacheVariables": {}
+    },
+    {
+      "name": "release-env",
+      "displayName": "release-env",
+      "hidden": true,
+      "environment": {
+        "ZEPHYR_BASE": "/home/ltdat/Desktop/physical_gunbound/gun_bot/m33_firmware/nxp_zephyr/zephyr",
+        "MCUX_VENV_PATH": "/home/ltdat/.mcuxpressotools/.mcux-venv-3.12/bin",
+        "ZEPHYR_SDK_INSTALL_DIR": "/home/ltdat/zephyr-sdk-0.17.4",
+        "PATH": "$env{MCUX_VENV_PATH}${pathListSep}$penv{PATH}",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "cacheVariables": {}
+    }
+  ],
+  "buildPresets": []
+}
