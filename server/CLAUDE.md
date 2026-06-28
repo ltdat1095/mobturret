@@ -50,6 +50,14 @@ per-handler code map.
 ## Local dev runtime
 
 - **HTTP framework:** Gin
+- **CORS:** **`github.com/gin-contrib/cors`** — the Flutter app hits
+  the API from a different origin (Android emulator `10.0.2.2`,
+  physical device on LAN). Without CORS, the browser preflight
+  blocks. Permissive in dev (allow `*`); locked-down in prod (allow
+  the deployed API Gateway origin only).
+- **UUIDs:** **`github.com/google/uuid`** — generates `user_id`
+  (PK in `Users` table, M2) and `request_id` (per-request log
+  correlation). Tiny dep, used everywhere.
 - **Config loader:** **Viper** (`github.com/spf13/viper`) — reads
   `.env` (dev) and environment variables (prod / Lambda). Live
   reloading in dev via `viper.WatchConfig()`. Single source of truth
@@ -82,11 +90,14 @@ server/
 │   │   ├── config.go                 # Viper-backed Config struct
 │   │   ├── logger.go                 # Zap logger provider
 │   │   ├── db.go                     # DynamoDB client provider
-│   │   └── server.go                 # *gin.Engine provider
+│   │   └── server.go                 # *gin.Engine provider (CORS, request-id)
 │   ├── config/                       # Config struct + Viper defaults
 │   ├── logger/                       # Zap factory + helpers
 │   ├── handlers/                     # Gin handler funcs (auth, turrets, …)
-│   ├── middleware/                   # auth (JWT), request-id, logging
+│   ├── middleware/
+│   │   ├── request_id.go             # uuid.NewString() → context + header
+│   │   ├── cors.go                   # gin-contrib/cors wrapper
+│   │   └── auth.go                   # JWT verify middleware (M2)
 │   └── db/                           # DynamoDB repos (users, turrets, commands)
 ├── .env.example                      # committed; documents every Viper key
 ├── go.mod
@@ -118,6 +129,8 @@ See [`./gun_bot_server/CLAUDE.md`](./gun_bot_server/CLAUDE.md).
 | Lib | Why |
 |---|---|
 | `github.com/gin-gonic/gin` | HTTP framework (local dev) |
+| `github.com/gin-contrib/cors` | CORS middleware for Flutter mobile/web clients |
+| `github.com/google/uuid` | `user_id` + `request_id` generation |
 | `github.com/spf13/viper` | Config from `.env` + env vars |
 | `go.uber.org/zap` | Structured logging |
 | `github.com/google/wire` | Compile-time DI |
@@ -125,6 +138,17 @@ See [`./gun_bot_server/CLAUDE.md`](./gun_bot_server/CLAUDE.md).
 | `github.com/golang-jwt/jwt/v5` | HS256 JWT issue/verify |
 | `golang.org/x/crypto/bcrypt` | Password hashing |
 | `github.com/aws/aws-lambda-go/lambda` | Lambda runtime for Phase 2 |
+
+## Deferred dependencies (decide per-milestone)
+
+| Lib | When to add |
+|---|---|
+| `github.com/go-playground/validator/v10` | M2 if request DTOs need more than Gin's built-in `binding` tags |
+| `github.com/stretchr/testify` | M2 if test boilerplate gets painful without it |
+| `github.com/swaggo/swag` + `swaggo/gin-swagger` | When the REST API surface stabilises (mid-Phase 1) |
+| `github.com/natefinch/lumberjack` | When we wire prod log shipping (Phase 2) |
+| `golang/mock` (gomock) | Only if hand-written DynamoDB stubs become painful |
+| `github.com/spf13/cobra` | When we add `migrate` / `seed` CLI subcommands (M3) |
 
 ## Related docs
 

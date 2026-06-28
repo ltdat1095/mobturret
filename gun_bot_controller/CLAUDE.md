@@ -67,23 +67,51 @@ gun_bot_controller/
 
 ## Cross-compile workflow (target)
 
-```bash
-# 1. Install the Yocto SDK on the dev machine (one-time, per Yocto release)
-./mobturret-a55-sdk-glibc-x86_64-setup.sh
-source /opt/mobturret-a55/environment-setup-aarch64-poky-linux
+The A55 system image is built by a **separate Yocto project** at
+`~/Desktop/autonomous_explorer/imx93-frdm-yocto/frdm-imx93`
+(MACHINE=`imx93-frdm`, DISTRO=`imx93-gunbot`). That project produces
+the SDK installer we cross-compile against.
 
-# 2. Build a ROS2 package against the SDK
+### One-time setup — build the SDK installer
+
+The Yocto project has built the rootfs image
+(`imx93-gunbot-imx93-frdm-*.wic`) but has **not** yet run
+`populate_sdk` — `tmp/deploy/sdk/` does not exist on the dev
+machine. Before M4 starts, the user needs to:
+
+```bash
+cd ~/Desktop/autonomous_explorer/imx93-frdm-yocto/frdm-imx93
+source setup-environment <build-dir>
+bitbake imx93-gunbot-imx93-frdm -c populate_sdk
+```
+
+This produces `tmp/deploy/sdk/imx93-gunbot-imx93-frdm-x86_64-<timestamp>-toolchain-<version>.sh`.
+
+### One-time setup — install the SDK on the dev machine
+
+```bash
+chmod +x <installer>.sh
+./<installer>.sh -y -d /opt/imx93-gunbot-sdk
+# Verify:
+source /opt/imx93-gunbot-sdk/environment-setup-aarch64-poky-linux
+echo $OECORE_NATIVE_SYSROOT   # should print /opt/imx93-gunbot-sdk/sysroots/cortexa55-poky-linux
+```
+
+### Per-build — cross-compile a ROS2 package
+
+```bash
+# Source the SDK (every fresh shell)
+source /opt/imx93-gunbot-sdk/environment-setup-aarch64-poky-linux
+
+# Build
 cd gun_bot_controller/ros2_ws
 colcon build --packages-select gun_controller \
   --cmake-args -DCMAKE_TOOLCHAIN_FILE=$OECORE_NATIVE_SYSROOT/usr/lib/aarch64-poky-linux/cmake/OEToolchainConfig.cmake
 
-# 3. Deploy to the FRDM
+# Deploy
 scp -r install/gun_controller root@imx93frdm:/opt/ros2_ws/
 ssh root@imx93frdm 'systemctl restart gun_controller.service'
 ```
-
-(Exact paths and toolchain filename depend on the Yocto SDK layout —
-to be filled in when M4 starts.)
 
 ## Open questions still to settle
 

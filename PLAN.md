@@ -95,7 +95,9 @@ the milestone is verified end-to-end, not when the code is written.
 - [ ] `docker-compose.yml` at repo root: DynamoDB Local on **port 8181** (no admin UI)
 - [ ] Go module under `server/cmd/server` — **Gin** HTTP framework,
       **Viper** for config (`.env`), **Zap** for logging, **Wire**
-      for DI (full module layout in `server/CLAUDE.md`)
+      for DI, **`gin-contrib/cors`** for CORS, **`google/uuid`** for
+      user_id + request_id (full module layout + locked deps in
+      `server/CLAUDE.md`)
 - [ ] Empty ROS2 workspace at `ros2_ws/` with two package skeletons:
       `gun_controller`, `cloud_bridge` (target: **ROS2 Humble
       Hawksbill** on Ubuntu 22.04)

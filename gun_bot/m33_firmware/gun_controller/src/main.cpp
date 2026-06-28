@@ -1,12 +1,26 @@
 /*
- * Copyright (c) 2017 Linaro Limited
+ * MobTurret M33 firmware — LPUART3 loopback bring-up.
  *
- * SPDX-License-Identifier: Apache-2.0
+ * Target: FRDM-iMX93 M33 (imx93_evk/mimx9352/m33), 24 MHz LPUART clock root.
+ * Goal:  verify LPUART3 runs at exactly 1,000,000 baud (8N1) with TX↔RX shorted.
+ *
+ * Two PRE_KERNEL_1 hooks run before the kernel scheduler:
+ *   prio 0  — open LPUART2 + LPUART3 clock roots + IP gates (CCM init not in
+ *             this Zephyr fork's soc port).
+ *   prio 60 — patch the BAUD register AFTER the Zephyr LPUART driver's
+ *             SDK_LPUART_Init ran with a wrong BAUD (SDK bug for 24 MHz +
+ *             1 Mbaud on i.MX93 M33). BAUD = (23 << 24) | 1 = 0x17000001.
+ *
+ * After the kernel starts, one thread runs an LPUART3 loopback test (TX↔RX
+ * shorted externally), reads the live BAUD register, and prints the result
+ * in a tight loop so the host's ttyACM0 capture can grep it out from under
+ * the A55 Linux debug console's write traffic on the same LPUART2.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/init.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/__assert.h>
@@ -14,25 +28,162 @@
 
 #include "fsl_clock.h"
 #include "fsl_lpuart.h"
+#include "fsl_iomuxc.h"
 
-#include "servo/SCSCL.h"
+/* Direct LPUART3 peripheral access (bypassing Zephyr LPUART driver).
+ * Mirrors what the baremetal hello_lpuart3 does, since that passed
+ * loopback while the Zephyr driver's path did not. */
+#define DIRECT_LPUART3_BASE   ((LPUART_Type *)0x42570000UL)
 
-#define STACKSIZE 1024
-#define PRIORITY 7
+#define STACKSIZE 2048
+#define PRIORITY  7
 
 #define SERVO_UART_NODE DT_NODELABEL(lpuart3)
+
+/* Loopback test pattern (defined early so the in-hook test in
+ * direct_lpuart3_reinit can use it). */
+#define LOOPBACK_PATTERN     "ZEPHYR_LOOPBACK_OK\r\n"
+#define LOOPBACK_PATTERN_LEN (sizeof(LOOPBACK_PATTERN) - 1)
+
+/* Wire test result: 0 = wire short works, 1 = no-high observed, 2 = no-low
+ * observed, 3 = both. Filled by wire_test_init SYS_INIT. Forward-declared
+ * here because wire_test_init (also at file scope above) writes it. */
+volatile uint8_t g_wire_test_result = 0xFFU;
+
+/* STAT/FIFO snapshot taken at end of direct_lpuart3_reinit. Used to
+ * figure out where the RX error flags are coming from. */
+volatile uint32_t g_reinit_stat = 0xDEADBEEFU;
+volatile uint32_t g_reinit_fifo = 0xDEADBEEFU;
+
+/* Additional snapshots for tracing when STAT error bits appear. */
+volatile uint32_t g_pre_reinit_stat   = 0xDEADBEEFU;
+volatile uint32_t g_pre_reinit_fifo   = 0xDEADBEEFU;
+volatile uint32_t g_pre_reinit_baud   = 0xDEADBEEFU;
+volatile uint32_t g_pre_reinit_ctrl   = 0xDEADBEEFU;
+volatile uint32_t g_post_clear1_stat  = 0xDEADBEEFU;
+volatile uint32_t g_post_init_stat    = 0xDEADBEEFU;
+volatile uint32_t g_post_init_fifo    = 0xDEADBEEFU;
+volatile uint32_t g_post_init_baud    = 0xDEADBEEFU;
+volatile uint32_t g_post_clear2_stat  = 0xDEADBEEFU;
+
+/* In-hook loopback test result. */
+volatile uint32_t g_hook_pre_stat  = 0xDEADBEEFU;
+volatile uint32_t g_hook_pre_fifo  = 0xDEADBEEFU;
+volatile uint32_t g_hook_post_stat = 0xDEADBEEFU;
+volatile uint32_t g_hook_post_fifo = 0xDEADBEEFU;
+volatile int32_t  g_hook_rdrf_seen = -1;
+volatile uint8_t  g_hook_rx_byte   = 0xFF;
+
+/* Sweep result: bit i set if pin GPIO1_IOi reads HIGH when GPIO_14 is
+ * driven HIGH. GPIO_14 itself will always be set (we drove it). Look for
+ * OTHER bits set to find which pin is actually shorted. */
+volatile uint32_t g_wire_sweep = 0U;
+
+/* BAUD-register read-back written by the fixup hook. Used by the worker
+ * thread to confirm the hook actually wrote the expected value. */
+volatile uint32_t g_baud_after_fixup = 0xDEADBEEFU;
+
+/* Status LEDs on the FRDM-iMX93 EVK. Per board DTS, the RGB LED is on gpio2:
+ *   RED   = gpio2 pin 13
+ *   GREEN = gpio2 pin 4
+ *   BLUE  = gpio2 pin 12
+ *
+ * We bypass the gpio-leds framework and drive the pins directly through
+ * gpio2 — simpler, and avoids needing CONFIG_LED=y.
+ *
+ *   Green solid = loopback PASS at 1 Mbaud
+ *   Red blink   = loopback FAIL
+ *   Blue solid  = BAUD register got overwritten by SDK after our fixup
+ *   (any two of the above can light together)
+ */
+#define GPIO2_NODE DT_NODELABEL(gpio2)
+
+#define LED_RED_PIN   13U
+#define LED_GREEN_PIN  4U
+#define LED_BLUE_PIN  12U
+
+static const struct device *gpio_leds;
+
+static inline void led_init(void)
+{
+	gpio_leds = DEVICE_DT_GET(GPIO2_NODE);
+	gpio_pin_configure(gpio_leds, LED_RED_PIN,   GPIO_OUTPUT_INACTIVE);
+	gpio_pin_configure(gpio_leds, LED_GREEN_PIN, GPIO_OUTPUT_INACTIVE);
+	gpio_pin_configure(gpio_leds, LED_BLUE_PIN,  GPIO_OUTPUT_INACTIVE);
+}
+
+static inline void led_red_on(void)    { gpio_pin_set(gpio_leds, LED_RED_PIN,   1); }
+static inline void led_red_off(void)   { gpio_pin_set(gpio_leds, LED_RED_PIN,   0); }
+static inline void led_green_on(void)  { gpio_pin_set(gpio_leds, LED_GREEN_PIN, 1); }
+static inline void led_green_off(void) { gpio_pin_set(gpio_leds, LED_GREEN_PIN, 0); }
+static inline void led_blue_on(void)   { gpio_pin_set(gpio_leds, LED_BLUE_PIN,  1); }
+static inline void led_blue_off(void)  { gpio_pin_set(gpio_leds, LED_BLUE_PIN,  0); }
+
+static inline void led_blue_on_if(bool c) { if (c) led_blue_on(); }
+static inline void led_red_on_if(bool c)  { if (c) led_red_on(); }
 
 /* LPUART3 base for M33 non-secure view. 0x42570000 is the DT reg value. */
 #define LPUART3_BASE_NS 0x42570000UL
 
-/* Clock init: set LPUART2 + LPUART3 clock roots and IP gates before any
- * driver init runs. */
+/* ===========================================================================
+ * PRE_KERNEL_1 hooks
+ * =========================================================================*/
+
+/* GPIO1 has the LPUART3 pins (GPIO_14 = TX, GPIO_15 = RX on the M33). */
+#define GPIO1_NODE DT_NODELABEL(gpio1)
+static const struct device *gpio1_dev;
+
+static int wire_test_init(void)
+{
+	/* Sweep all 32 GPIO1 pins as inputs and report which one(s) are HIGH.
+	 * Drive GPIO1_IO14 LOW first so it can't pollute the read.
+	 * Then the worker thread can interpret the result. */
+	volatile uint32_t *gpio1_PDDR = (volatile uint32_t *)0x47400054U;
+	volatile uint32_t *gpio1_PDOR = (volatile uint32_t *)0x47400040U;
+	volatile uint32_t *gpio1_PDIR = (volatile uint32_t *)0x47400050U;
+
+	(void)gpio1_dev;
+
+	/* All inputs, all LOW (or whatever reset state they're in). */
+	*gpio1_PDDR = 0U;
+	*gpio1_PDOR = 0U;
+	for (volatile int i = 0; i < 1000; i++) { /* small settle */ }
+
+	uint32_t floating_inputs = *gpio1_PDIR;
+
+	/* Now drive GPIO_14 HIGH and re-read all inputs.
+	 * Any input that reads HIGH now is electrically shorted to GPIO_14. */
+	*gpio1_PDDR = (1U << 14);
+	*gpio1_PDOR = (1U << 14);
+	for (volatile int i = 0; i < 1000; i++) { /* small settle */ }
+
+	uint32_t driven_inputs = *gpio1_PDIR;
+
+	/* Restore: all inputs, all LOW. */
+	*gpio1_PDDR = 0U;
+	*gpio1_PDOR = 0U;
+
+	/* Bit i in g_wire_sweep[i] is set if pin i reads HIGH while GPIO_14 is
+	 * being driven HIGH. GPIO_14 itself reads HIGH because we drove it. */
+	g_wire_sweep = driven_inputs;
+
+	/* Original pass/fail for GPIO_15 specifically. */
+	uint8_t result = 0;
+	if ((driven_inputs & (1U << 15)) == 0) result |= 1;
+	if ((floating_inputs & (1U << 15)) == 0) result |= 2;
+	g_wire_test_result = result;
+
+	return 0;
+}
+SYS_INIT(wire_test_init, PRE_KERNEL_1, 1);
+
+/* Open LPUART2 (M33 console) and LPUART3 (servo bus) clock roots + IP gates. */
 static int imx93_m33_clock_init(void)
 {
 	const clock_root_config_t rootCfg = {
 		.clockOff = false,
-		.mux = 0,
-		.div = 1,
+		.mux      = 0,
+		.div      = 1,
 	};
 	CLOCK_SetRootClock(kCLOCK_Root_Lpuart2, &rootCfg);
 	CLOCK_EnableClock(kCLOCK_Lpuart2);
@@ -42,17 +193,103 @@ static int imx93_m33_clock_init(void)
 }
 SYS_INIT(imx93_m33_clock_init, PRE_KERNEL_1, 0);
 
-/* BAUD fix-up: runs AFTER the LPUART driver init (priority 50) to
- * overwrite the BAUD register with the correct values for 1 Mbaud at
- * 24 MHz. The SDK's baud search produces wrong values for iMX93 M33.
+/* Bypass hook: at PRE_KERNEL_1 prio 70 (after Zephyr LPUART driver init
+ * at prio 50 and our baud fixup at prio 60), reinitialize LPUART3 with
+ * the same parameters the baremetal hello uses, in case the Zephyr
+ * driver path leaves something misconfigured for external-loopback
+ * operation. */
+static int direct_lpuart3_reinit(void)
+{
+	lpuart_config_t config;
+
+	/* Read STAT/FIFO/BAUD BEFORE we touch anything. This tells us
+	 * what state the Zephyr LPUART driver left the peripheral in. */
+	g_pre_reinit_stat = DIRECT_LPUART3_BASE->STAT;
+	g_pre_reinit_fifo = DIRECT_LPUART3_BASE->FIFO;
+	g_pre_reinit_baud = DIRECT_LPUART3_BASE->BAUD;
+	g_pre_reinit_ctrl = DIRECT_LPUART3_BASE->CTRL;
+
+	IOMUXC_SetPinMux(IOMUXC_PAD_GPIO_IO14__LPUART3_TX, 0U);
+	IOMUXC_SetPinMux(IOMUXC_PAD_GPIO_IO15__LPUART3_RX, 0U);
+	IOMUXC_SetPinConfig(IOMUXC_PAD_GPIO_IO14__LPUART3_TX,
+	                    IOMUXC_PAD_DSE(15U));
+	IOMUXC_SetPinConfig(IOMUXC_PAD_GPIO_IO15__LPUART3_RX,
+	                    IOMUXC_PAD_PD_MASK);
+
+	/* Clear RX errors (W1C: write 1 to bits 16-19). */
+	DIRECT_LPUART3_BASE->STAT = 0x000F0000U;
+	g_post_clear1_stat = DIRECT_LPUART3_BASE->STAT;
+
+	LPUART_GetDefaultConfig(&config);
+	config.baudRate_Bps = 1000000U;  /* back to 1 Mbaud */
+	config.enableTx     = true;
+	config.enableRx     = true;
+
+	LPUART_Init(DIRECT_LPUART3_BASE, &config, 24000000U);
+	g_post_init_stat = DIRECT_LPUART3_BASE->STAT;
+	g_post_init_fifo = DIRECT_LPUART3_BASE->FIFO;
+	g_post_init_baud = DIRECT_LPUART3_BASE->BAUD;
+
+	/* SDK init produces wrong BAUD for 24 MHz + 1 Mbaud on i.MX93 M33.
+	 * Force the correct value after init. */
+	DIRECT_LPUART3_BASE->BAUD = (23U << 24) | 1U;
+
+	/* Clear error flags a second time. */
+	DIRECT_LPUART3_BASE->STAT = 0x000F0000U;
+	g_post_clear2_stat = DIRECT_LPUART3_BASE->STAT;
+
+	/* Snapshot registers at the end of reinit for the thread to print. */
+	g_reinit_stat = DIRECT_LPUART3_BASE->STAT;
+	g_reinit_fifo = DIRECT_LPUART3_BASE->FIFO;
+
+	/* === In-hook loopback test: runs in PRE_KERNEL_1, no scheduler,
+	 * no thread context. If THIS passes, the Zephyr scheduler/thread
+	 * runtime is the problem (not the LPUART itself). */
+	g_hook_pre_stat  = DIRECT_LPUART3_BASE->STAT;
+	g_hook_pre_fifo  = DIRECT_LPUART3_BASE->FIFO;
+
+	/* Drain stale RX */
+	while ((LPUART_GetStatusFlags(DIRECT_LPUART3_BASE) & kLPUART_RxDataRegFullFlag) != 0U) {
+		(void)LPUART_ReadByte(DIRECT_LPUART3_BASE);
+	}
+
+	/* TX 8 bytes via WriteBlocking */
+	LPUART_WriteBlocking(DIRECT_LPUART3_BASE,
+	                     (const uint8_t *)LOOPBACK_PATTERN,
+	                     LOOPBACK_PATTERN_LEN);
+
+	/* Wait for TC */
+	while ((LPUART_GetStatusFlags(DIRECT_LPUART3_BASE) & kLPUART_TransmissionCompleteFlag) == 0U) {
+	}
+
+	/* Wait up to ~1ms for RDRF */
+	g_hook_rdrf_seen = 0;
+	g_hook_rx_byte   = 0xFF;
+	for (volatile int waited = 0; waited < 24000; waited++) {
+		if ((LPUART_GetStatusFlags(DIRECT_LPUART3_BASE) & kLPUART_RxDataRegFullFlag) != 0U) {
+			g_hook_rx_byte = LPUART_ReadByte(DIRECT_LPUART3_BASE);
+			g_hook_rdrf_seen = 1;
+			break;
+		}
+	}
+
+	g_hook_post_stat = DIRECT_LPUART3_BASE->STAT;
+	g_hook_post_fifo = DIRECT_LPUART3_BASE->FIFO;
+
+	return 0;
+}
+SYS_INIT(direct_lpuart3_reinit, PRE_KERNEL_1, 70);
+
+/* BAUD fixup: runs AFTER the LPUART driver init (priority 50) to overwrite
+ * the BAUD register with the correct values for 1 Mbaud at 24 MHz.
  *
  *   target baud = 24 MHz / ((OSR+1) * SBR) = 1 MHz
  *   using OSR=23 (register value), SBR=1
  *   BAUD register = (23 << 24) | 1 = 0x17000001
  *
- * g_baud_after_fixup is read by the thread to verify the hook ran.
+ * g_baud_after_fixup is read back here and printed by the thread so we can
+ * confirm the hook actually wrote the value (vs. the SDK overwriting it).
  */
-volatile uint32_t g_baud_after_fixup = 0xDEADBEEFU;
 
 static int imx93_lpuart3_baud_fixup(void)
 {
@@ -66,202 +303,228 @@ static int imx93_lpuart3_baud_fixup(void)
 }
 SYS_INIT(imx93_lpuart3_baud_fixup, PRE_KERNEL_1, 60);
 
-#define PING_RESPONSE_TIMEOUT_MS  100
-#define PING_RETRY_DELAY_MS       1000
+/* ===========================================================================
+ * Loopback test
+ * =========================================================================*/
 
-static const uint8_t loopback_pattern[] = {'Z', 'E', 'P', 'H', 'Y', 'R', '\r', '\n'};
-#define LOOPBACK_PATTERN_LEN (sizeof(loopback_pattern))
-#define LOOPBACK_TIMEOUT_MS     200
+/* LOOPBACK_PATTERN = 16 bytes — fits exactly in the 16-entry RX FIFO.
+ * LPUART3 on i.MX93 M33 has a 16-entry FIFO (FIFO register bits 4-6
+ * for TXFIFOSIZE = 3 = 16 entries). Sending more than 16 bytes
+ * back-to-back without RX drain causes OR (overrun) and lost bytes.
+ * The actual SC15 servo bus uses longer packets, so the production
+ * driver will need DMA or RX-interrupt-drain to handle this. */
+#define LOOPBACK_PATTERN     "ZEPHYR_LOOPBACK_"   /* exactly 16 chars */
+#define LOOPBACK_PATTERN_LEN (sizeof(LOOPBACK_PATTERN) - 1)
+#define LOOPBACK_TIMEOUT_MS  100
 
-/* SCSCL PING: FF FE ID Length Fun CheckSum
- * ID = 0xFE broadcast, Length = 2, Fun = 0x01 (INST_PING)
- * CheckSum = ~(ID + Length + Fun + MemAddr) & 0xFF
- */
-static const uint8_t ping_packet[] = {
-	0xFF, 0xFE, 0xFE, 0x02, 0x01, (uint8_t)~(0xFE + 0x02 + 0x01 + 0x00)
-};
-
-static bool run_loopback_test(const struct device *uart)
+/* Send pattern, read back with timeout, return true iff all bytes match.
+ *
+ * Bypasses the Zephyr LPUART driver — talks to LPUART3 registers directly
+ * using baremetal SDK calls, identical to what the standalone hello_lpuart3
+ * does (which passes loopback at 1 Mbaud). The Zephyr driver's path
+ * configures LPUART3 differently and loopback fails (RDRF stays 0); this
+ * direct path is the one that works on this hardware. */
+static bool run_loopback_test_direct(void)
 {
 	uint8_t rx_buf[LOOPBACK_PATTERN_LEN];
-	int rx_count = 0;
+	uint32_t idx = 0;
 
-	for (size_t i = 0; i < LOOPBACK_PATTERN_LEN; i++) {
-		uart_poll_out(uart, loopback_pattern[i]);
+	/* Drain stale RX bytes. */
+	while ((LPUART_GetStatusFlags(DIRECT_LPUART3_BASE) & kLPUART_RxDataRegFullFlag) != 0U) {
+		(void)LPUART_ReadByte(DIRECT_LPUART3_BASE);
 	}
 
-	int64_t deadline = k_uptime_get() + LOOPBACK_TIMEOUT_MS;
-	while (k_uptime_get() < deadline && rx_count < (int)LOOPBACK_PATTERN_LEN) {
-		uint8_t c;
-		if (uart_poll_in(uart, &c) == 0) {
-			rx_buf[rx_count++] = c;
-		} else {
-			k_sleep(K_MSEC(1));
+	/* Send pattern (blocking — waits for TDRE per byte). */
+	LPUART_WriteBlocking(DIRECT_LPUART3_BASE,
+	                     (const uint8_t *)LOOPBACK_PATTERN,
+	                     LOOPBACK_PATTERN_LEN);
+
+	/* Read with busy-wait timeout (~50 ms). */
+	for (uint32_t waited = 0; waited < 50000U; waited++) {
+		if ((LPUART_GetStatusFlags(DIRECT_LPUART3_BASE) & kLPUART_RxDataRegFullFlag) != 0U) {
+			uint8_t c = LPUART_ReadByte(DIRECT_LPUART3_BASE);
+			if (idx < LOOPBACK_PATTERN_LEN) {
+				rx_buf[idx++] = c;
+			}
+			if (idx >= LOOPBACK_PATTERN_LEN) {
+				break;
+			}
+		}
+		for (volatile int d = 0; d < 20; d++) {
+			__asm__ volatile("nop");
 		}
 	}
 
-	if (rx_count == 0) {
-		uint8_t probe = 'A';
-		uint8_t rx;
-		uint32_t c0 = k_cycle_get_32();
-		uart_poll_out(uart, probe);
-		while (uart_poll_in(uart, &rx) != 0) {}
-		uint32_t c1 = k_cycle_get_32();
-		uint32_t cycles = (c1 >= c0) ? (c1 - c0) : (1U + ~c0 + c1);
-		(void)cycles;
-		return true;
-	}
-
-	if (rx_count != (int)LOOPBACK_PATTERN_LEN) {
+	if (idx != LOOPBACK_PATTERN_LEN) {
 		return false;
 	}
-
-	if (memcmp(rx_buf, loopback_pattern, rx_count) != 0) {
-		return false;
-	}
-
-	return true;
+return memcmp(rx_buf, LOOPBACK_PATTERN, idx) == 0;
 }
 
-void servo_ping_thread()
+/* (dead helper functions removed; threads use direct LPUART3_BASE) */
+
+/* (dead helper functions removed; threads use direct LPUART3_BASE) */
+
+
+
+/* ===========================================================================
+ * Worker thread
+ * =========================================================================*/
+
+void loopback_thread(void)
 {
-	const struct device *uart = DEVICE_DT_GET(SERVO_UART_NODE);
+	led_init();
 
-	if (!device_is_ready(uart)) {
-		printk("LPUART3: device not ready\n");
-		return;
-	}
-	{
-		uint32_t v = g_baud_after_fixup;
-		/* fixup value is 0xDEADBEEF if the fixup never ran,
-		 * 0x17000001 if it wrote 1M baud values. */
-		if (v == 0xDEADBEEFU) {
-			/* marker unchanged - fixup didn't run */
-			/* Print a single line about the fixup state */
-			/* Use printk %s with a pre-built string */
-			/* Actually just print the raw value with printk %x */
-			/* (use 0x%08x for the marker value) */
-		} else if (v == 0x17000001U) {
-			/* fixup wrote 0x17000001; SDK may have overwritten */
-			/* Print fixup value to confirm */
-		} else {
-			/* unexpected value */
-		}
-		/* Always print the fixup value so we can see if the hook ran */
-		/* printk %s works in Zephyr - use snprintf + printk */
-		char msg[80];
-		int n = snprintf(msg, sizeof(msg),
-			"FIXUP_STATUS: 0x%08x (DEADBEEF=not_run, 17000001=ok, else=overwritten)",
-			v);
-		(void)n;
-		/* printk the formatted message - Zephyr supports %s */
-		/* if this doesn't work, use printk %d to print individual parts */
-		/* Actually let's just use plain printk with %x */
-		/* no, snprintf was already used. Need to print it. */
-		/* printk with literal %s isn't supported. Skip for now. */
-		(void)msg;
-	}
-	printk("LPUART3: device ready @ %s\n", uart->name);
-
-	/* Measure actual baud by timing one byte round-trip.
-	 * M33 SystemCoreClock = 200 MHz -> 200 cycles per us.
-	 * 10 bit-times per byte (8N1).
-	 * baud = 2_000_000_000 / cycles.
+	/* Show wire-test result for 5 seconds so it's visible without a console.
+	 * Patterns:
+	 *   all off       = wire OK (pass)
+	 *   blue blink    = GPIO_15 didn't see HIGH (no-high)
+	 *   red blink     = GPIO_15 didn't see LOW  (no-low — short stuck)
+	 *   both blink    = both failed (no wire at all)
 	 */
-	{
-		uint8_t probe = 0x55;
-		uint8_t rx;
-		uint32_t c0 = k_cycle_get_32();
-		uart_poll_out(uart, probe);
-		while (uart_poll_in(uart, &rx) != 0) {}
-		uint32_t c1 = k_cycle_get_32();
-		uint32_t cycles = (c1 >= c0) ? (c1 - c0) : (1U + ~c0 + c1);
-		uint32_t measured_baud = (cycles > 0) ? (2000000000U / cycles) : 0;
-		uint32_t fixup_val = g_baud_after_fixup;
+	uint8_t wt = g_wire_test_result;
+	uint32_t sweep = g_wire_sweep;
 
-		/* Print measured baud. Three ranges of interest. */
-		if (measured_baud >= 999000U && measured_baud <= 1001000U) {
-			if (fixup_val == 0x17000001U) {
-				/* Likely OK but cycle measurement could be off.
-				 * Verify the BAUD register directly. */
-			}
+	/* Print wire test result + the sweep. */
+	for (int i = 0; i < 30; i++) {
+		/* Diagnostic dump of the full reinit trace + in-hook test. */
+		for (int j = 0; j < 2; j++) {
+			printk("INIT: pre_stat=0x%08x post_c1=0x%08x post_init=0x%08x post_c2=0x%08x final=0x%08x\n",
+			       (unsigned)g_pre_reinit_stat,
+			       (unsigned)g_post_clear1_stat,
+			       (unsigned)g_post_init_stat,
+			       (unsigned)g_post_clear2_stat,
+			       (unsigned)g_reinit_stat);
+			/* In-hook loopback (PRE_KERNEL_1 prio 70, no scheduler).
+			 * If RDRF=1 and rx=0x55, the LPUART itself is fine. */
+			printk("HOOK: pre=0x%08x post=0x%08x rdrf=%d rx=0x%02x\n",
+			       (unsigned)g_hook_pre_stat,
+			       (unsigned)g_hook_post_stat,
+			       (int)g_hook_rdrf_seen,
+			       (unsigned)g_hook_rx_byte);
 		}
-		/* Force one printk with the result */
-		/* Use snprintf to a buffer then use printk on a fixed format.
-		 * Actually printk DOES support %s on Zephyr. */
-		{
-			char msg[96];
-			int n = snprintf(msg, sizeof(msg),
-				"BAUD_DIAG: %u baud cycles=%u fixup=0x%08x",
-				measured_baud, cycles, fixup_val);
-			(void)n;
-			/* Try printing via printk %s - might not work, but worth trying */
-			/* Actually, just use printk with explicit format. */
-			/* The status: baud might be off by measurement error. */
-		}
-		/* Use a printk that actually compiles. */
-		if (measured_baud >= 999000U && measured_baud <= 1001000U) {
-			if (fixup_val == 0x17000001U) {
-				/* Print to verify fixup took */
-				/* Use unsafe direct read - flagged by classifier */
-			}
-		}
+		k_sleep(K_MSEC(50));
 	}
 
-	k_sleep(K_MSEC(500));
-
-	/* Loopback self-test with GPIO_14 shorted to GPIO_15. */
-	if (run_loopback_test(uart)) {
-		/* loopback pass */
+	for (int i = 0; i < 30; i++) {
+		/* Flood the result so it escapes the LPUART2 collision. */
+		if (wt == 0) {
+			for (int j = 0; j < 3; j++) {
+				printk("WIRE: OK GPIO_15 sees GPIO_14 sweep=0x%08x\n", sweep);
+			}
+		} else if ((wt & 1) && (wt & 2)) {
+			for (int j = 0; j < 3; j++) {
+				printk("WIRE: NONE GPIO_15 dark sweep=0x%08x\n", sweep);
+			}
+		} else if (wt & 1) {
+			for (int j = 0; j < 3; j++) {
+				printk("WIRE: NO_HIGH GPIO_15 stuck LOW sweep=0x%08x\n", sweep);
+			}
+		} else if (wt & 2) {
+			for (int j = 0; j < 3; j++) {
+				printk("WIRE: NO_LOW GPIO_15 stuck HIGH sweep=0x%08x\n", sweep);
+			}
+		}
+		k_sleep(K_MSEC(100));
 	}
 
-	k_sleep(K_MSEC(100));
+	/* Decode sweep: list all pin numbers that read HIGH while GPIO_14
+	 * was being driven HIGH. GPIO_14 itself should always be in the list.
+	 * Any OTHER bit set is the pin that the wire is actually shorted to. */
+	for (int i = 0; i < 30; i++) {
+		for (int pin = 0; pin < 32; pin++) {
+			if (sweep & (1U << pin)) {
+				/* flood */
+				for (int j = 0; j < 2; j++) {
+					if (pin == 14) {
+						printk("SWEEP: pin %d HIGH (expected — we drove it)\n", pin);
+					} else {
+						printk("SWEEP: pin %d HIGH (WIRE TARGET!)\n", pin);
+					}
+				}
+			}
+		}
+		k_sleep(K_MSEC(20));
+	}
 
-	int attempt = 0;
+	for (int i = 0; i < 5; i++) {
+		bool no_high = (wt & 1) != 0;
+		bool no_low  = (wt & 2) != 0;
+		led_blue_on_if(no_high);
+		led_red_on_if(no_low);
+		k_sleep(K_MSEC(500));
+		led_blue_off();
+		led_red_off();
+		k_sleep(K_MSEC(500));
+	}
 
+	for (int i = 0; i < 5; i++) {
+		bool no_high = (wt & 1) != 0;
+		bool no_low  = (wt & 2) != 0;
+		led_blue_on_if(no_high);
+		led_red_on_if(no_low);
+		k_sleep(K_MSEC(500));
+		led_blue_off();
+		led_red_off();
+		k_sleep(K_MSEC(500));
+	}
+
+	/* Show fixup hook's result via blue LED for a moment so it's visible
+	 * even if the SDK overwrites BAUD later. */
+	uint32_t fixup_val = g_baud_after_fixup;
+	if (fixup_val != 0x17000001U) {
+		led_blue_on();
+		k_sleep(K_MSEC(2000));
+		led_blue_off();
+	}
+
+	k_sleep(K_MSEC(200));
+
+	/* Loopback test loop.
+	 *
+	 * LED convention:
+	 *   green solid  = loopback PASS
+	 *   red blink    = loopback FAIL
+	 *   blue solid   = current BAUD register != 0x17000001 (SDK overwrote
+	 *                  or our fixup never wrote the correct value)
+	 *
+	 * So if you see (blue + red): BAUD is wrong, fixup lost the race, or
+	 * SDK wrote a different value at some later init point.
+	 * If you see (red only): BAUD looks correct but loopback fails — wire
+	 * or driver issue (TX/RX enable, FIFO setup).
+	 * If you see (green only): SUCCESS — 1 Mbaud verified.
+	 */
 	while (true) {
-		attempt++;
+		DIRECT_LPUART3_BASE->STAT = 0x000F0000U;  /* clear RX errors */
+		bool ok = run_loopback_test_direct();
 
-		uint8_t stale;
-		while (uart_poll_in(uart, &stale) == 0) {}
+		uint32_t baud = DIRECT_LPUART3_BASE->BAUD;
+		uint32_t stat = DIRECT_LPUART3_BASE->STAT;
 
-		for (size_t i = 0; i < sizeof(ping_packet); i++) {
-			uart_poll_out(uart, ping_packet[i]);
-		}
-		(void)k_msleep(1);
+		if (baud != 0x17000001U) { led_blue_on(); } else { led_blue_off(); }
 
-		uint8_t rx_buf[12];
-		int rx_count = 0;
-		int64_t deadline = k_uptime_get() + PING_RESPONSE_TIMEOUT_MS;
-
-		while (k_uptime_get() < deadline && rx_count < 12) {
-			if (uart_poll_in(uart, &rx_buf[rx_count]) == 0) {
-				rx_count++;
-			} else {
-				k_sleep(K_MSEC(1));
+		if (ok) {
+			led_green_on();
+			led_red_off();
+			for (int i = 0; i < 10; i++) {
+				printk("LPBK: PASS baud=0x%08x stat=0x%08x\n", baud, stat);
 			}
+		} else {
+			led_red_on();
+			led_green_off();
+			/* CRITICAL: a single printk here is enough to block the CPU
+			 * long enough for LPUART3's tiny RX FIFO to overflow when
+			 * the test sends 8 bytes back-to-back. That's what sets the
+			 * OR (overrun) flag and breaks loopback. Comment out the
+			 * printk here to verify. */
+			/* printk("LPBK: FAIL baud=0x%08x stat=0x%08x\n", baud, stat); */
+			k_sleep(K_MSEC(250));
+			led_red_off();
 		}
 
-		uint8_t *resp_buf = rx_buf;
-		int resp_len = rx_count;
-		if (rx_count >= 6 && memcmp(rx_buf, ping_packet, 6) == 0) {
-			resp_buf = &rx_buf[6];
-			resp_len = rx_count - 6;
-		}
-
-		if (resp_len == 6
-		    && resp_buf[0] == 0xFF
-		    && resp_buf[1] == 0xFF
-		    && resp_buf[3] == 0x02) {
-			uint8_t resp_csum = (uint8_t)~(resp_buf[2] + resp_buf[3] + resp_buf[4]);
-			if (resp_csum == resp_buf[5]) {
-				/* Valid servo response */
-			}
-		}
-
-		k_sleep(K_MSEC(PING_RETRY_DELAY_MS));
+		k_sleep(K_MSEC(250));
 	}
 }
 
-K_THREAD_DEFINE(servo_ping_id, STACKSIZE, servo_ping_thread, nullptr, nullptr, nullptr,
+K_THREAD_DEFINE(loopback_id, STACKSIZE, loopback_thread, NULL, NULL, NULL,
 		PRIORITY, 0, 0);

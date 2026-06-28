@@ -11,6 +11,7 @@ subproject.
 
 > **What to read first:**
 > - `PLAN.md` — phases & milestones (what we're building, in what order)
+> - `INFRASTRUCTURE.md` — runtime topology (where everything runs, what protocols connect them)
 > - `design.md` — architecture (what the system is)
 > - `IPC.md` — A55 ↔ M33 wire contract (how the cores talk)
 > - Subproject `CLAUDE.md` — build & run for the part you're touching
@@ -106,14 +107,14 @@ Do not redefine the wire format in a subproject. Change the canonical
 - `PLAN.md` — phases & milestones. The execution plan; what we're
   building and in what order. **Check this before starting any new
   milestone.**
+- `INFRASTRUCTURE.md` — runtime topology diagrams (Phase 1 + Phase 2
+  preview + happy-path sequence). Where every process runs, what
+  protocol each link uses.
 - `design.md` — full system architecture (MQTT topics, DynamoDB schema,
   mobile workflows). **The source of truth for what MobTurret is.**
 - `IPC.md` — A55 ↔ M33 RPMsg wire contract.
 - `gun_bot/CLAUDE.md`, `gun_bot/IPC.md`, `gun_bot/TROUBLESHOOTING.md`
   — M33 firmware deep-dive.
-- `gun_bot/PLANE.md` — historical bring-up checklist from the
-  inherited repo; out of date relative to the new MobTurret scope
-  (only Stage 1 of the M33 mechanism was completed).
 
 ---
 
