@@ -73,7 +73,7 @@ implementation map.
 | `m33_firmware/gun_controller/prj.conf` | `CONFIG_SERIAL`, `CONFIG_UART_MCUX_LPUART`, etc. |
 | `m33_firmware/gun_controller/CMakePresets.json` | debug/release presets; `BOARD=imx93_evk/mimx9352/m33` |
 | `m33_firmware/gun_controller/SERVOS.md` | Bench servo inventory and SCSCL reference |
-| `m33_firmware/nxp_zephyr/` | Zephyr tree (the `__repo__` symlink points to the upstream source of truth) |
+| `m33_firmware/nxp_zephyr` | Symlink → `~/mobturret-forks/zephyr` (user's GitHub fork, upstream zephyr main, `hal_nxp` from upstream). MobTurret SDK baud-override patch is applied directly to the fork's `modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.c`. |
 
 ---
 
@@ -103,8 +103,10 @@ cmake --build --preset=debug
 
 ### Environment
 
-- **ZEPHYR_BASE:** `m33_firmware/nxp_zephyr/zephyr` (cloned —
-  see "Fetch the vendor trees" below)
+- **ZEPHYR_BASE:** `m33_firmware/nxp_zephyr` (resolves through the
+  symlink to `~/mobturret-forks/zephyr` — the user's fork's source
+  root, not a workspace subdir). Set in `mcux_include.json` under the
+  `debug-env` / `release-env` preset `environment` blocks.
 - **Zephyr SDK:** `~/zephyr-sdk-0.17.4` (installed once)
 - **Toolchain venv:** `~/.mcuxpressotools/.mcux-venv-3.12/bin`
 - **MCUXpresso SDK:** `mcusdk_m33_firmware/sdks/mcimx93_evk_blank_sdk/mcuxsdk/`
@@ -113,19 +115,29 @@ cmake --build --preset=debug
 ### Fetch the vendor trees (one-time setup)
 
 The Zephyr source tree and the MCUXpresso SDK are upstream vendor
-sources and are **not tracked in git** — they're gitignored. Fetch
-them once after cloning this repo:
+sources and are **not tracked in git** — they're gitignored. The
+project's `nxp_zephyr` path is a **symlink** to the user's local fork
+clone at `~/mobturret-forks/zephyr`. Set that up once:
 
 ```bash
-# Zephyr (NXP downstream fork, branch nxp-v4.3.0)
-cd gun_bot/m33_firmware
-git clone --branch nxp-v4.3.0 --depth 1 \
-  https://github.com/nxp-zephyr/zephyr.git nxp_zephyr
-# west update pulls the rest of the modules
-cd nxp_zephyr
+# Zephyr — use the user's GitHub fork (upstream zephyr main, with
+# hal_nxp pulled in as a west submodule from zephyrproject-rtos).
+# The fork root is a west workspace; the zephyr source is at zephyr/.
+mkdir -p ~/mobturret-forks
+cd ~/mobturret-forks
+git clone --depth 1 https://github.com/ltdat1095/zephyr.git
+cd zephyr
 pipx install west   # or: pip install --user west
 west init -l .
-west update
+west update          # pulls modules/hal/nxp, modules/crypto/..., etc.
+
+# Wire the project to the fork:
+ln -s /home/ltdat/mobturret-forks/zephyr \
+    /home/ltdat/Desktop/mobturret/gun_bot/m33_firmware/nxp_zephyr
+
+# Apply the MobTurret SDK baud-override patch:
+cd ~/mobturret-forks/modules/hal/nxp
+git apply /path/to/mobturret/gun_bot/m33_firmware/gun_controller/fork-snapshots/nxp-zephyr-fork/0001-fsl_lpuart-1mbaud-baud-override-fork4.5.patch
 
 # MCUXpresso SDK for i.MX93 EVK
 cd ../../mcusdk_m33_firmware
@@ -139,6 +151,12 @@ unzip ~/Downloads/mcimx93_evk_blank_sdk.zip -d .
 The repo's `.gitignore` keeps these paths out of git. Build artifacts
 under `debug/`, `release/`, `build/`, `install/`, `log/` are also
 gitignored — see the root `.gitignore`.
+
+> **Migration history:** Before 2026-06-28 the project used NXP's
+> downstream fork (`nxp-zephyr/zephyr` at `nxp-v4.3.0`) checked out
+> directly under `m33_firmware/nxp_zephyr/`. The pre-migration tree is
+> preserved at `m33_firmware/nxp_zephyr.bak/` (gitignored) for
+> archaeology; delete it once you're sure you don't need to compare.
 
 ---
 

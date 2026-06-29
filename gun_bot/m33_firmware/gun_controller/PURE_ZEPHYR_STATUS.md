@@ -105,3 +105,66 @@ scp gun_bot/m33_firmware/gun_controller/fork-snapshots/working-binaries/zephyr_v
 ```
 
 The 550+ loopback PASSes are reproducible from this binary. For the actual servo bus (16-byte FIFO limit), see `ZEPHYR_M33_UART3_SC15SERVO.md` for the DMA / interrupt-driven drain plan.
+
+---
+
+## Pure-Zephyr migration — DONE (2026-06-28)
+
+The plan in `~/.claude/plans/quizzical-cooking-kitten.md` was executed. The
+fork at `~/mobturret-forks/zephyr` (upstream zephyr main, 4.4.99) now has:
+
+1. **`zephyr/dts/arm/nxp/imx/nxp_imx93_m33.dtsi`** — `lpuart3` node added
+   at line 260 (after `lpuart2`): compatible `nxp,imx-lpuart`,`nxp,lpuart`,
+   reg `0x42570000` (64K), NVIC IRQ 68 prio 3, clock `IMX_CCM_LPUART3_CLK`,
+   status `disabled`.
+2. **`zephyr/boards/nxp/imx93_evk/imx93_evk-pinctrl.dtsi`** — `uart3_default`
+   pinctrl group added at line 30, referencing `iomuxc1_gpio_io14_lpuart_tx_lpuart3_tx`
+   and `iomuxc1_gpio_io15_lpuart_rx_lpuart3_rx` (which were already
+   declared in `hal_nxp`'s `mimx9352cvuxk-pinctrl.dtsi` lines 885/909
+   under `/omit-if-no-ref/`).
+3. **`zephyr/drivers/clock_control/clock_control_mcux_ccm_rev2.c`** —
+   LPUART cases added to all three clock driver entry points:
+   - `mcux_ccm_on`: `IMX_CCM_LPUART{1..8}_CLK` →
+     `CLOCK_EnableClock(kCLOCK_Lpuart1 + instance)`.
+   - `mcux_ccm_get_subsys_rate`: extended existing LPUART1/2 case to
+     cover LPUART1..8 — `clock_root = kCLOCK_Root_Lpuart1 + instance`.
+   - `mcux_ccm_set_subsys_rate` (gated by `CONFIG_SOC_MIMX9352 &&
+     CONFIG_UART_MCUX_LPUART`): new case that calls
+     `CLOCK_SetRootClock(kCLOCK_Root_Lpuart1 + instance, &cfg)` with
+     `{ clockOff=false, mux=0, div=1 }` to bring LPUART{1..8} clock
+     roots up to 24 MHz.
+
+The project side:
+
+4. **`boards/imx93_evk_mimx9352_m33.overlay`** — replaced empty
+   comment-only content with `&lpuart3 { status="okay"; current-speed
+   = <1000000>; pinctrl-0 = <&uart3_default>; pinctrl-names = "default"; }`.
+5. **`src/main.cpp`** — full rewrite. No more `#include "fsl_*.h"`,
+   no more `LPUART_WriteBlocking` / `LPUART_Init` / `CLOCK_SetRootClock`.
+   The four PRE_KERNEL_1 hooks collapse to one (`lpuart_clocks_init`
+   at prio 0) that uses Zephyr's `clock_control_configure()` API. The
+   loopback thread uses `uart_poll_in` / `uart_poll_out` against
+   `DEVICE_DT_GET(DT_NODELABEL(lpuart3))`.
+
+**Build:** `cmake --preset=debug && cmake --build --preset=debug` succeeds
+on the first try — no link errors, no `__device_dts_ord_*` issues.
+Generated `debug/zephyr/zephyr.dts` shows `lpuart3` enabled with the
+correct reg, IRQ, clock spec, status=okay, current-speed=1M,
+pinctrl-0=<&uart3_default>. ELF symbols confirm two LPUART driver
+instances (`mcux_lpuart_0_config`, `mcux_lpuart_1_config`) and
+`mcux_lpuart_poll_in`/`poll_out` are linked.
+
+**Output:** `debug/zephyr/zephyr.elf`, 35,976 bytes FLASH (27.45% of 128 KB),
+10,740 bytes RAM (8.46% of 124 KB). Saved as
+`fork-snapshots/working-binaries/zephyr_v51_pure_zephyr.elf` (md5
+`97f4650337d819b0e40379fb01bbb21d`).
+
+**Hardware verification still pending:** deploy via the standard remoteproc
+dance and confirm 1 Mbaud loopback PASS counts (target: 550+) on the
+FRDM-iMX93 with GPIO_14 ↔ GPIO_15 shorted. See
+`mobturret/memory/project-m33-lpuart3-1mbaud.md` §9 for the cheatsheet.
+
+**Rollback:** the previous baremetal path is preserved as
+`fork-snapshots/working-binaries/zephyr_v48_1mbaud_16byte_loopback.elf`
+(md5 692,080 bytes) — git checkout main.cpp at the previous commit
+and rebuild.

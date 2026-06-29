@@ -6,47 +6,54 @@ on the FRDM-iMX93 board, using Zephyr's `nxp,imx-lpuart` driver.
 If you only need the high-level project layout, see `../../CLAUDE.md` at the
 repo root.
 
-> **STATUS (2026-06-28):** 1 Mbaud is verified working on hardware via the
-> standalone baremetal path (`mcusdk_m33_firmware/mcimx93_evk_blank/hello_lpuart3.c`,
-> 2000+ PASSes). **The Zephyr path still fails loopback** because the LPUART3
-> STAT register ends up with RX error flags set (PF|FE|NF|OR = bits 16-19).
-> See `~/.claude/projects/-home-ltdat-Desktop-mobturret/memory/project-m33-lpuart3-1mbaud.md`
-> for full diagnostic detail and the two paths forward.
-> The SDK patches, build, deploy, and console-capture cheatsheets in this
-> doc are still accurate.
+> **STATUS (2026-06-28):** **Pure-Zephyr path implemented.** `main.cpp`
+> uses `uart_poll_in`/`uart_poll_out` against a DTS-bound LPUART3 — no
+> baremetal SDK calls. Fork patches (lpuart3 dtsi node, `uart3_default`
+> pinctrl, LPUART cases in `clock_control_mcux_ccm_rev2.c`) landed in
+> `~/mobturret-forks/zephyr`. Build succeeds (`debug/zephyr/zephyr.elf`,
+> 35,976 bytes FLASH). **Hardware verification still pending** — deploy
+> via the remoteproc dance and confirm 1 Mbaud loopback PASS counts.
+> See `PURE_ZEPHYR_STATUS.md` (the "Pure-Zephyr migration — DONE" section
+> at the bottom) and `~/.claude/projects/-home-ltdat-Desktop-mobturret/memory/project-zephyr-fork-migration.md`.
 >
 > **All session state lives in MCP memory** at
-> `~/.claude/projects/-home-ltdat-Desktop-mobturret/memory/project-m33-lpuart3-1mbaud.md`
-> — referenced throughout this doc as "memory `project-m33-lpuart3-1mbaud.md`".
+> `~/.claude/projects/-home-ltdat-Desktop-mobturret/memory/`
+> (see `project-m33-lpuart3-1mbaud.md` and `project-zephyr-fork-migration.md`).
 > The in-repo `PROGRESS.md` is **archived** (frozen 2026-06-28); update memory, not PROGRESS.md.
 
 ## TL;DR
 
-The Zephyr build for `imx93_evk/mimx9352/m33` does **not** initialise the
-CCM clock tree at boot. The four fixes below are mandatory for any
-peripheral to work (not just LPUART3):
+The pure-Zephyr path drives LPUART3 via Zephyr's `mcux_lpuart` driver
+bound to a devicetree node. The fix-up set is:
 
-1. **`imx93_m33_clock_init` SYS_INIT hook** in `src/main.cpp` (PRE_KERNEL_1,
-   priority 0) — configures clock root source/divider + IP gate for every
-   peripheral you use. Without this, even the console is silent.
-2. **App overlay** at `boards/imx93_evk_mimx9352_m33.overlay` — currently
-   **empty (comment only)**. The `lpuart3` node was removed because the
-   Zephyr LPUART driver path left STAT register error flags set, breaking
-   loopback. main.cpp drives LPUART3 directly via the MCUXpresso SDK
-   at PRE_KERNEL_1 prio 70.
-3. **`prj.conf`** — `CONFIG_SERIAL=y` + `CONFIG_UART_MCUX_LPUART=y` +
-   `CONFIG_UART_INTERRUPT_DRIVEN=n` (the n is important — see memory `project-m33-lpuart3-1mbaud.md` §5).
-4. **Linux remoteproc workflow** — the firmware is loaded by Linux on the
-   A55, not flashed standalone. See "Deploy via Linux" below.
+1. **Fork patches** in `~/mobturret-forks/zephyr`:
+   - `zephyr/dts/arm/nxp/imx/nxp_imx93_m33.dtsi` declares `lpuart3`.
+   - `zephyr/boards/nxp/imx93_evk/imx93_evk-pinctrl.dtsi` declares
+     `uart3_default` (GPIO_14 = TX, GPIO_15 = RX).
+   - `zephyr/drivers/clock_control/clock_control_mcux_ccm_rev2.c` adds
+     `IMX_CCM_LPUART{1..8}_CLK` cases to `mcux_ccm_on`,
+     `mcux_ccm_get_subsys_rate`, and `mcux_ccm_set_subsys_rate`.
+2. **App overlay** `boards/imx93_evk_mimx9352_m33.overlay` — enables
+   `&lpuart3` with `current-speed = <1000000>` and `pinctrl-0 = <&uart3_default>`.
+3. **`src/main.cpp`** — uses `clock_control_configure()` for LPUART2/3
+   clock roots (PRE_KERNEL_1 prio 0) and `uart_poll_in`/`uart_poll_out`
+   for loopback. No `#include "fsl_*.h"`.
+4. **`prj.conf`** — `CONFIG_SERIAL=y` + `CONFIG_UART_MCUX_LPUART=y` +
+   `CONFIG_UART_INTERRUPT_DRIVEN=n` (the `n` is important).
+5. **Linux remoteproc workflow** — the firmware is loaded by Linux on
+   the A55, not flashed standalone. See "Deploy via Linux" below.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `src/main.cpp` | SYS_INIT clock + baud fixup hooks; loopback thread with direct LPUART3 access (bypasses Zephyr driver) |
-| `boards/imx93_evk_mimx9352_m33.overlay` | Currently empty (comment only) — see memory `project-m33-lpuart3-1mbaud.md` §4 |
+| `src/main.cpp` | Pure-Zephyr: PRE_KERNEL_1 clock_configure hook + uart_poll loopback |
+| `boards/imx93_evk_mimx9352_m33.overlay` | Enables `&lpuart3` with 1 Mbaud + `uart3_default` pinctrl |
 | `prj.conf` | CONFIG_SERIAL, CONFIG_UART_MCUX_LPUART, CONFIG_UART_INTERRUPT_DRIVEN=n |
-| (memory: `project-m33-lpuart3-1mbaud.md`) | **Live session log: SDK patches, register dumps, open issues, paths forward.** Lives in `~/.claude/projects/-home-ltdat-Desktop-mobturret/memory/`, NOT in this repo. The in-repo `PROGRESS.md` is archived. |
+| (memory: `project-m33-lpuart3-1mbaud.md`) | **1 Mbaud diagnostic state** (SDK patches, register dumps, FIFO-depth finding). Lives in `~/.claude/projects/-home-ltdat-Desktop-mobturret/memory/`. |
+| (memory: `project-zephyr-fork-migration.md`) | **Fork migration path map** — what lives where after the 2026-06-28 fork swap. |
+| `PURE_ZEPHYR_STATUS.md` | The pure-zephyr migration journal: previous revert + the "DONE (2026-06-28)" section at the bottom with the full file list. |
+| `fork-snapshots/FORK.md` | Fork-and-PR workflow doc. |
 | `README.rst` | High-level overview |
 | `sample.yaml` | Twister harness config — regex matches `printk()` output |
 
@@ -60,12 +67,15 @@ cmake --build --preset=debug
 
 Output: `debug/zephyr/zephyr.elf` (gdb), `debug/zephyr/zephyr.bin` (raw).
 
-If the build fails with `inverseTxd`, `enableTxRTS`, `txRtsPolarity`,
-or `kLPUART_RtsPolarityLow` errors, the SDK patches have been lost.
-See `nxp_zephyr/modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.c`
-and re-apply:
-- Baud override at lines 435-444 (LPUART_Init) and 855-864 (LPUART_SetBaudRate)
-- `#if 0 / * MobTurret: ... * / #endif` wrappers at lines 540, 595, 601, 767
+If the build fails with **baud-rate errors** (1 Mbaud not landing on
+`BAUD=0x17000001`), the SDK baud-override patch has been lost. Re-apply
+from
+`fork-snapshots/nxp-zephyr-fork/0001-fsl_lpuart-1mbaud-baud-override-fork4.5.patch`
+to the fork's `modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.c`
+(lands at lines 435 and 850). The struct/enum `#if 0` blocks from the
+old NXP-downstream patch are **not** needed on the upstream fork —
+`lpuart_config_t` carries `inverseTxd`, `enableTxRTS`, `enableTxCTS`,
+`txRtsPolarity` etc. on this SDK.
 
 See memory `project-m33-lpuart3-1mbaud.md` §3 for md5s of expected file states.
 
@@ -154,8 +164,10 @@ Three other workarounds if you can't use the above:
 
 ## Why the SYS_INIT clock hook is mandatory
 
-The Zephyr iMX93 M33 soc port (`nxp_zephyr/zephyr/soc/nxp/imx/imx9/imx93/m33/`)
-only zeroes DTCM and clears a sleep-hold bit. **No CCM setup**.
+The Zephyr iMX93 M33 soc port (`nxp_zephyr/soc/nxp/imx/imx9/imx93/m33/`,
+resolving through the symlink to
+`~/mobturret-forks/zephyr/soc/nxp/imx/imx9/imx93/m33/`) only zeroes DTCM
+and clears a sleep-hold bit. **No CCM setup**.
 
 Compare to MCUXpresso's `hello_lpuart3.c`, which calls `BOARD_InitHardware()`
 in `main()` — that function explicitly does:
@@ -182,12 +194,12 @@ only flips the IP gate (`CLOCK_EnableClock` → LPCG), it does **not** call
 `CLOCK_SetRootClock` to clear the OFF bit and configure mux/div. This is
 a gap in this Zephyr fork's clock driver.
 
-## SDK baud-rate patch (in `nxp_zephyr/.../fsl_lpuart.c`)
+## SDK baud-rate patch (in fork's `modules/hal/nxp/.../fsl_lpuart.c`)
 
 The SDK's baud search loop on i.MX93 M33 with 24 MHz clock + 1 Mbaud target
 produces `BAUD=0x00000404` (SBR=1028, OSR_field=0) which gives ~820 kbaud.
 
-**Patch at line 435 (LPUART_Init) and 855 (LPUART_SetBaudRate):**
+**Patch lands at line 435 (`LPUART_Init`) and line 850 (`LPUART_SetBaudRate`):**
 
 ```c
 /* MobTurret workaround: SDK's baud search produces wrong SBR/OSR for
@@ -205,15 +217,26 @@ if (srcClock_Hz == 24000000U && baudRate_Bps == 1000000U)
 For `LPUART_Init` the variable is `config->baudRate_Bps`; for
 `LPUART_SetBaudRate` it's the bare parameter `baudRate_Bps`.
 
+The patch lives at
+`fork-snapshots/nxp-zephyr-fork/0001-fsl_lpuart-1mbaud-baud-override-fork4.5.patch`
+and is applied against the user's fork at
+`~/mobturret-forks/modules/hal/nxp` (a west submodule of
+`~/mobturret-forks/zephyr`).
+
 There's also a `g_baud_after_fixup` global in `src/main.cpp` that's read
 back after `imx93_lpuart3_baud_fixup` (PRE_KERNEL_1 prio 60) writes BAUD
 directly to LPUART3 — verifies the fixup actually ran.
 
-### SDK struct/enum stripping (4 blocks)
+### SDK struct/enum stripping — NOT NEEDED on the fork
 
-Upstream `fsl_lpuart.c` references struct members and an enum value that
-don't exist on i.MX93's `lpuart_config_t`. Wrap the references in `#if 0`
-blocks at lines 540, 595, 601, 767.
+The previous NXP-downstream fork (`nxp-zephyr/zephyr` `nxp-v4.3.0`)
+lacked `inverseTxd`, `enableTxRTS`, `enableTxCTS`, `txRtsPolarity`,
+`kLPUART_CtsSampleAtStart`, and `kLPUART_CtsSourcePin` in i.MX93's
+`lpuart_config_t`, requiring `#if 0` blocks in `fsl_lpuart.c` around
+those references. **The upstream fork's SDK has all of these** (see
+`modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.h` — fields
+at lines 264-269, 281, enums at lines 87, 94, 101), so no stripping is
+needed.
 
 ## Verification steps (in order)
 

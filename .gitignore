@@ -20,9 +20,18 @@
 # A. Vendored upstream source trees (fetch separately — see CLAUDE.md)
 # ----------------------------------------------------------------------------
 
-# NXP downstream Zephyr fork (nxp-v4.3.0). Cloned from
-# https://github.com/nxp-zephyr/zephyr at branch nxp-v4.3.0.
-gun_bot/m33_firmware/nxp_zephyr/
+# Zephyr source — symlink to user's GitHub fork at
+# ~/mobturret-forks/zephyr (upstream zephyr main, hal_nxp pulled via
+# `west update`). The MobTurret SDK baud-override patch is applied
+# directly to the fork's modules/hal/nxp/mcux-sdk-ng/drivers/lpuart
+# directory; see fork-snapshots/nxp-zephyr-fork/0001-...fork4.5.patch
+# for the diff.
+gun_bot/m33_firmware/nxp_zephyr
+
+# Pre-2026-06-28 NXP downstream zephyr tree, kept as a backup during
+# the migration to the user's fork. Safe to delete once the new path
+# is verified on hardware.
+gun_bot/m33_firmware/nxp_zephyr.bak/
 
 # NXP MCUXpresso SDK bundle for the i.MX93 EVK. Downloaded as a zip from
 # NXP's MCUXpresso SDK Builder.

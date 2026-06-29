@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mobturret": {
+      "command": "python3",
+      "args": ["-m", "mobturret_mcp.server"],
+      "cwd": "/home/ltdat/Desktop/mobturret/mcp/mobturret_mcp",
+      "env": {
+        "PYTHONPATH": "/home/ltdat/Desktop/mobturret/mcp/mobturret_mcp",
+        "MOBTURRET_REPO": "/home/ltdat/Desktop/mobturret"
+      }
+    }
+  }
+}

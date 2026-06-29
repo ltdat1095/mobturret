@@ -1,20 +1,20 @@
 /*
  * LPUART3 overlay for FRDM-iMX93 M33 core.
  *
- * Note: we intentionally do NOT declare the LPUART3 node here. The
- * Zephyr LPUART driver leaves the FIFO with TXOF/RXUF error flags and
- * the STAT register with PF/FE/NF/OR RX error flags set, which keeps
- * RDRF stuck at 0 and prevents external loopback from succeeding.
+ * Pure-Zephyr path: the LPUART3 node from the fork's
+ * nxp_imx93_m33.dtsi (disabled by default) is enabled here, bound to
+ * the mcux_lpuart driver, and routed through uart3_default pinctrl
+ * (GPIO_IO14 -> LPUART3_TX, GPIO_IO15 -> LPUART3_RX). main.cpp drives
+ * the bus via Zephyr's uart_poll_in / uart_poll_out against this node.
  *
- * main.cpp drives LPUART3 entirely via the baremetal MCUXpresso SDK
- * (LPUART_Init / LPUART_ReadByte / LPUART_WriteBlocking), matching
- * what the standalone hello_lpuart3 does — that path passes loopback
- * at 1 Mbaud cleanly.
- *
- * LPUART3 base for M33 non-secure view = 0x42570000
- * IRQ = 68 (NVIC, ARMv8-M)
- * Clock root = Lpuart3, sourced from Osc24M with div=1
- * Pinmux: GPIO_IO14 -> LPUART3_TX, GPIO_IO15 -> LPUART3_RX
- *
- * Two-pin mode with external short (TX ↔ RX) on GPIO_14/GPIO_15.
+ * Two-pin mode with external short (TX ↔ RX) on GPIO_14/GPIO_15 for
+ * loopback bring-up.
  */
+
+/* SPDX-License-Identifier: Apache-2.0 */
+&lpuart3 {
+	status = "okay";
+	current-speed = <1000000>;
+	pinctrl-0 = <&uart3_default>;
+	pinctrl-names = "default";
+};

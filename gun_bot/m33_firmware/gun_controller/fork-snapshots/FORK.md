@@ -4,6 +4,25 @@ This document describes how to maintain MobTurret's M33 firmware patches as
 **branches in your own GitHub fork** of `zephyrproject-rtos/zephyr` (and
 `nxp-mcuxpresso/mcuxsdk`), and how to upstream them as PRs.
 
+> **Status (2026-06-28):** Migration to the user's fork is **done** for the
+> project itself. `gun_bot/m33_firmware/nxp_zephyr` is a symlink to
+> `~/mobturret-forks/zephyr` (upstream zephyr main, `hal_nxp` from
+> upstream `zephyrproject-rtos/hal_nxp`). The SDK baud-override patch
+> from `0001-fsl_lpuart-1mbaud-baud-override-fork4.5.patch` is applied
+> directly to `~/mobturret-forks/modules/hal/nxp` (the west-managed
+> submodule). See `mcux_include.json` `debug-env.environment.ZEPHYR_BASE`
+> for the new path. The old NXP-downstream tree is preserved at
+> `gun_bot/m33_firmware/nxp_zephyr.bak/`.
+>
+> **Pure-Zephyr LPUART3 path is also landed (2026-06-28).** `main.cpp` no
+> longer calls into the baremetal MCUXpresso SDK — it uses Zephyr's
+> `clock_control_configure()` (PRE_KERNEL_1 prio 0 hook) and
+> `uart_poll_in`/`uart_poll_out` against a DTS-bound `lpuart3`. Required
+> fork patches: `lpuart3` dtsi node, `uart3_default` pinctrl group, and
+> LPUART clock-root/IP-gate cases in `clock_control_mcux_ccm_rev2.c`.
+> See `PURE_ZEPHYR_STATUS.md` (the "Pure-Zephyr migration — DONE"
+> section) for the full file list.
+
 The current state in this repo uses a **local clone of nxp-zephyr's fork of
 Zephyr** at `mobturret/gun_bot/m33_firmware/nxp_zephyr/`. That directory is
 gitignored (vendored upstream source). The MobTurret patches are applied
