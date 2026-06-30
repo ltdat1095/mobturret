@@ -17,16 +17,17 @@
 # ============================================================================
 
 # ----------------------------------------------------------------------------
-# A. Vendored upstream source trees (fetch separately — see CLAUDE.md)
+# A. Vendored upstream source trees
 # ----------------------------------------------------------------------------
-
-# Zephyr source — symlink to user's GitHub fork at
-# ~/mobturret-forks/zephyr (upstream zephyr main, hal_nxp pulled via
-# `west update`). The MobTurret SDK baud-override patch is applied
-# directly to the fork's modules/hal/nxp/mcux-sdk-ng/drivers/lpuart
-# directory; see fork-snapshots/nxp-zephyr-fork/0001-...fork4.5.patch
-# for the diff.
-gun_bot/m33_firmware/nxp_zephyr
+#
+# The Zephyr source tree is a registered git submodule (see
+# .gitmodules) at gun_bot/m33_firmware/nxp_zephyr, pointing at
+# github.com/ltdat1095/zephyr (user's fork of zephyrproject-rtos/zephyr).
+# Clone it with: `git submodule update --init --recursive`.
+#
+# The MobTurret SDK baud-override patch is applied directly to the
+# fork's modules/hal/nxp/mcux-sdk-ng/drivers/lpuart directory; see
+# fork-snapshots/nxp-zephyr-fork/0001-...fork4.5.patch for the diff.
 
 # Pre-2026-06-28 NXP downstream zephyr tree, kept as a backup during
 # the migration to the user's fork. Safe to delete once the new path

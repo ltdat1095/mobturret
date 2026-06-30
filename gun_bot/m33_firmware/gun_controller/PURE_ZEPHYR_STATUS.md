@@ -123,8 +123,12 @@ fork at `~/mobturret-forks/zephyr` (upstream zephyr main, 4.4.99) now has:
    declared in `hal_nxp`'s `mimx9352cvuxk-pinctrl.dtsi` lines 885/909
    under `/omit-if-no-ref/`).
 3. **`zephyr/drivers/clock_control/clock_control_mcux_ccm_rev2.c`** —
-   LPUART cases added to all three clock driver entry points:
+   LPUART cases added to all three clock driver entry points
+   (captured in patch `0001-ccm-rev2-lpuart-clock-root.patch`, added
+   2026-06-30 to resolve the cold-boot hang):
    - `mcux_ccm_on`: `IMX_CCM_LPUART{1..8}_CLK` →
+     `CLOCK_SetRootClock(kCLOCK_Root_Lpuart1 + instance, &cfg)` with
+     `{ clockOff=false, mux=0, div=1 }` (24 MHz XTAL pass-through) AND
      `CLOCK_EnableClock(kCLOCK_Lpuart1 + instance)`.
    - `mcux_ccm_get_subsys_rate`: extended existing LPUART1/2 case to
      cover LPUART1..8 — `clock_root = kCLOCK_Root_Lpuart1 + instance`.

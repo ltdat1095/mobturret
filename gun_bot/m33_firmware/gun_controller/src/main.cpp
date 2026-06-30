@@ -10,9 +10,11 @@
  *     current-speed=1M, pinctrl-0=<&uart3_default>). The mcux_lpuart driver
  *     in zephyr/drivers/serial binds to it at PRE_KERNEL_1 prio 50.
  *   - One PRE_KERNEL_1 hook (prio 0) brings up the LPUART2 (console) and
- *     LPUART3 (servo) clock roots via Zephyr's clock_control_configure()
- *     API. The fork's clock_control_mcux_ccm_rev2.c has the matching
- *     IMX_CCM_LPUART{1..8}_CLK cases.
+ *     LPUART3 (servo) clock roots via Zephyr's clock_control_on() API.
+ *     The fork's clock_control_mcux_ccm_rev2.c has the matching
+ *     IMX_CCM_LPUART{1..8}_CLK cases in mcux_ccm_on() (added 2026-06-30,
+ *     patch in fork-snapshots/nxp-zephyr-fork/0001-ccm-rev2-lpuart-clock-root.patch)
+ *     that call CLOCK_SetRootClock() and CLOCK_EnableClock() in sequence.
  *   - The MobTurret 1 Mbaud SDK baud-override patch lives in the fork's
  *     modules/hal/nxp/mcux/mcux-sdk-ng/drivers/lpuart/fsl_lpuart.c (lines
  *     435 and 850). When LPUART_Init runs from the Zephyr driver, the
@@ -45,7 +47,10 @@
 #define LOOPBACK_PATTERN     "ZEPHYR_LOOPBACK_"
 #define LOOPBACK_PATTERN_LEN (sizeof(LOOPBACK_PATTERN) - 1)
 
-#define LPUART_CLOCK_HZ      24000000U
+/* LPUART peripheral clock root is configured to 24 MHz XTAL pass-through
+ * (mux=0, div=1) by the lpuart_clocks_init() SYS_INIT hook below — see
+ * the fork patch in fork-snapshots/nxp-zephyr-fork/0001-ccm-rev2-lpuart-clock-root.patch.
+ * LPUART baud target is 1 Mbaud for SC15 servo bus compatibility. */
 #define LPUART_BAUD_BPS      1000000U
 
 /* Onboard RGB LEDs on gpio2 (per FRDM-iMX93 EVK DTS):
@@ -87,13 +92,22 @@ static inline void led_blue_off(void)  { gpio_pin_set(gpio_leds, LED_BLUE_PIN,  
  * =========================================================================*/
 
 /* Bring up LPUART2 (M33 console) and LPUART3 (servo bus) clock roots via
- * Zephyr's clock_control_configure() API. The fork's
+ * Zephyr's clock_control_on() API.  The fork's
  * drivers/clock_control/clock_control_mcux_ccm_rev2.c has the matching
- * cases (added 2026-06-28). Runs at PRE_KERNEL_1 prio 0 so the clock
- * roots are up before the LPUART driver binds at CONFIG_SERIAL_INIT_PRIORITY
- * (50) and calls LPUART_Init — without this, clock_control_get_rate()
- * returns 0 inside the driver, the SDK's baud search divides by zero,
- * and the LPUART peripheral hangs (TDRE never clears).
+ * IMX_CCM_LPUART{1..8}_CLK cases (added 2026-06-30) that call
+ * CLOCK_SetRootClock() (mux=0, div=1, clockOff=false -> 24 MHz XTAL
+ * pass-through) and CLOCK_EnableClock() in mcux_ccm_on().
+ *
+ * Runs at PRE_KERNEL_1 prio 0 so the clock roots are up before the LPUART
+ * driver binds at CONFIG_SERIAL_INIT_PRIORITY (50) and calls LPUART_Init
+ * via its own clock_control_on() + clock_control_get_rate() path.
+ *
+ * Why clock_control_on() rather than clock_control_configure(): the latter
+ * routes through api->configure, which the mcux clock driver does not set
+ * (the API struct only has .on / .off / .get_rate / .set_rate).  Without
+ * the new mcux_ccm_set_subsys_rate case for LPUART, configure() would
+ * return -ENOTSUP / -ENOSYS.  clock_control_on() matches what the LPUART
+ * driver itself does internally (uart_mcux_lpuart.c:1359).
  */
 static int lpuart_clocks_init(void)
 {
@@ -103,16 +117,14 @@ static int lpuart_clocks_init(void)
 		return -ENODEV;
 	}
 
-	rc = clock_control_configure(ccm_dev,
-		(clock_control_subsys_t)IMX_CCM_LPUART2_CLK,
-		(clock_control_subsys_rate_t)LPUART_CLOCK_HZ);
+	rc = clock_control_on(ccm_dev,
+		(clock_control_subsys_t)IMX_CCM_LPUART2_CLK);
 	if (rc != 0) {
 		return rc;
 	}
 
-	rc = clock_control_configure(ccm_dev,
-		(clock_control_subsys_t)IMX_CCM_LPUART3_CLK,
-		(clock_control_subsys_rate_t)LPUART_CLOCK_HZ);
+	rc = clock_control_on(ccm_dev,
+		(clock_control_subsys_t)IMX_CCM_LPUART3_CLK);
 	if (rc != 0) {
 		return rc;
 	}

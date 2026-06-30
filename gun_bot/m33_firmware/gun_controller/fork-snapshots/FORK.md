@@ -16,10 +16,12 @@ This document describes how to maintain MobTurret's M33 firmware patches as
 >
 > **Pure-Zephyr LPUART3 path is also landed (2026-06-28).** `main.cpp` no
 > longer calls into the baremetal MCUXpresso SDK — it uses Zephyr's
-> `clock_control_configure()` (PRE_KERNEL_1 prio 0 hook) and
+> `clock_control_on()` (PRE_KERNEL_1 prio 0 hook) and
 > `uart_poll_in`/`uart_poll_out` against a DTS-bound `lpuart3`. Required
 > fork patches: `lpuart3` dtsi node, `uart3_default` pinctrl group, and
-> LPUART clock-root/IP-gate cases in `clock_control_mcux_ccm_rev2.c`.
+> LPUART clock-root/IP-gate cases in `clock_control_mcux_ccm_rev2.c`
+> (added 2026-06-30 in patch
+> `0001-ccm-rev2-lpuart-clock-root.patch`).
 > See `PURE_ZEPHYR_STATUS.md` (the "Pure-Zephyr migration — DONE"
 > section) for the full file list.
 
@@ -35,6 +37,13 @@ fork-and-PR workflow. It contains:
 - `nxp-zephyr-fork/0001-fsl_lpuart-1mbaud-baud-override.patch` — a
   unified diff against the upstream clean version (md5
   `a17206cdcae8ba5ea234e6de5d47e9a4`). Apply with `git am`.
+- `nxp-zephyr-fork/0001-ccm-rev2-lpuart-clock-root.patch` — Zephyr clock
+  driver patch that adds LPUART1..8 clock-root configuration in
+  `mcux_ccm_on` / `mcux_ccm_get_subsys_rate` / `mcux_ccm_set_subsys_rate`.
+  Resolves the cold-boot hang on i.MX93 M33 (CCM clock root OFF bit
+  persists in always-on domain; baremetal-then-Zephyr works around it but
+  Zephyr-alone needs the clock driver to call `CLOCK_SetRootClock()`).
+  Apply against the zephyr fork with `git am` or `git apply`.
 - `working-binaries/zephyr_v48_1mbaud_16byte_loopback.elf` — the
   Zephyr firmware that PASSes 550+ times at 1 Mbaud with a 16-byte
   loopback pattern. Deployed via Linux remoteproc.
