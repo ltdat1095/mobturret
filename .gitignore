@@ -34,13 +34,29 @@
 # is verified on hardware.
 gun_bot/m33_firmware/nxp_zephyr.bak/
 
-# NXP MCUXpresso SDK bundle for the i.MX93 EVK. Downloaded as a zip from
-# NXP's MCUXpresso SDK Builder.
-gun_bot/mcusdk_m33_firmware/
-
 # Broken external symlink left over from the upstream physical_gunbound
 # repo — points outside this tree and is meaningless on a fresh clone.
 gun_bot/m33_firmware/gun_controller/__repo__
+
+# ----------------------------------------------------------------------------
+# West workspace output (populated by `west update`).
+#
+# `nxp_zephyr` itself IS tracked as a git submodule (see .gitmodules).
+# Everything else under `m33_firmware/` that is "modules/", "bootloader/",
+# "tools/", or ".west/" is created by west and must NEVER be committed —
+# these live in upstream zephyrproject-rtos repos.
+#
+#   modules/    — west pulls hal_nxp + CMSIS + lib + others here.
+#                 modules/hal/nxp at c7f1b8449 carries the MobTurret
+#                 1 Mbaud SDK patch.
+#   bootloader/ — west pulls MCUboot here (only used by sysbuild).
+#   tools/      — west pulls host-tools scripts here.
+#   .west/      — west's own config dir (manifest path).
+# ----------------------------------------------------------------------------
+gun_bot/m33_firmware/modules/
+gun_bot/m33_firmware/bootloader/
+gun_bot/m33_firmware/tools/
+gun_bot/m33_firmware/.west/
 
 
 # ----------------------------------------------------------------------------
