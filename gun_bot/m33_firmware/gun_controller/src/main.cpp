@@ -14,14 +14,10 @@
  *   prio 50 — Zephyr LPUART driver binds, calls LPUART_Init(). The
  *             hal_nxp @ c7f1b8449 fork has the 1 Mbaud override in
  *             fsl_lpuart.c (lines 435 / 850) so BAUD = 0x17000001 directly.
- *   prio 7  — loopback_thread: every 1 s, send 16-byte pattern on
- *             LPUART3 (matches M33 RX FIFO depth), echo loopback, log
- *             result to LPUART2.
- *
- * For full PASS, wire GPIO_IO14 ↔ GPIO_IO15 on the FRDM (a single Dupont
- * jumper). Without the wire, the firmware still runs and prints FAIL —
- * that's fine: it proves the LPUART3 path is alive at 1 Mbaud and ready
- * for SC15 servo traffic.
+ *   prio 7  — loopback_thread: every 1 s, scan-ping SCSCL IDs 1..5 on
+ *             LPUART3 (via the Waveshare Bus Servo Adapter A) and log
+ *             which IDs responded. Each ping is 6 bytes (well under
+ *             the 16-byte RX FIFO).
  */
 
 #include <zephyr/kernel.h>
@@ -43,11 +39,18 @@
 #define STACKSIZE 2048
 #define PRIORITY  7
 
-/* 16-byte pattern fits the M33 LPUART3 RX FIFO exactly (FIFO TXFIFOSIZE = 3 = 16).
- * Anything longer without intermediate RX drain sets the OR (overrun) flag.
- * See memory project-m33-lpuart3-1mbaud.md §7 for the 16-vs-21 root-cause. */
-#define LOOPBACK_PATTERN     "ZEPHYR_LOOPBACK_"
-#define LOOPBACK_PATTERN_LEN (sizeof(LOOPBACK_PATTERN) - 1)
+/* SCSCL PING (INST_PING=0x01). 6 bytes total — well under the 16-byte RX
+ * FIFO. Packet layout (bytes 0..5):
+ *   0,1   0xFF, 0xFF   header
+ *   2     ID            target ID (0xFE = broadcast; 1..253 = specific)
+ *   3     0x02          length (instruction + checksum = 2)
+ *   4     0x01          INST_PING
+ *   5     ~sum          checksum = ~(ID + Length + Instr), low byte
+ *
+ * Built per-ping in run_ping_test() so we can target different IDs. */
+#define PING_PACKET_LEN  6U
+#define PING_SCAN_ID_MIN 1U
+#define PING_SCAN_ID_MAX 5U
 
 static const struct device *const ccm_dev =
 	DEVICE_DT_GET(DT_NODELABEL(ccm));
@@ -86,29 +89,45 @@ static inline uint32_t lpuart3_read(uint32_t offset)
 }
 
 /* ===========================================================================
- * Loopback test — pure Zephyr (uart_poll_in / uart_poll_out)
+ * SC15 ping test — pure Zephyr (uart_poll_in / uart_poll_out).
+ *
+ * Send a 6-byte SCSCL PING targeted at one ID and try to read a 6-byte
+ * response. The response is a status packet:
+ *   0,1   0xFF, 0xFF   header
+ *   2     ID            responding servo's ID
+ *   3     0x02          length
+ *   4     ERR           error code (0 = OK)
+ *   5     ~sum          checksum
+ *
+ * Identical UART polling pattern to the snapshot loopback test — that's
+ * the known-good path. Only the packet and response check change.
  * =========================================================================*/
 
-static bool run_loopback_test(uint32_t *const baud_out, uint32_t *const stat_out)
+static bool run_ping_test(uint8_t target_id, uint8_t *const resp_id_out)
 {
-	uint8_t rx_buf[LOOPBACK_PATTERN_LEN] = {0};
+	uint8_t rx_buf[PING_PACKET_LEN] = {0};
 	uint32_t idx = 0;
 	unsigned char c;
 	int rc;
 
-	/* Drain stale RX from previous iterations. */
+	/* Drain stale RX from previous iterations / responses. */
 	while (uart_poll_in(lpuart3_dev, &c) == 0) { /* discard */ }
 
-	/* TX pattern byte-by-byte. */
-	for (size_t i = 0; i < LOOPBACK_PATTERN_LEN; i++) {
-		uart_poll_out(lpuart3_dev, LOOPBACK_PATTERN[i]);
+	/* Build the SCSCL PING packet for this target ID. */
+	const uint8_t chk = (uint8_t)~(target_id + 0x02U + 0x01U);
+	uint8_t pkt[PING_PACKET_LEN] = {
+		0xFF, 0xFF, target_id, 0x02, 0x01, chk
+	};
+
+	/* TX packet byte-by-byte. */
+	for (size_t i = 0; i < PING_PACKET_LEN; i++) {
+		uart_poll_out(lpuart3_dev, pkt[i]);
 	}
 
-	/* Read with busy-wait timeout. At 24 MHz CPU clock and 1 Mbaud,
-	 * each bit-time is ~24 CPU cycles. 16 byte-times × 10 bit-times +
-	 * slack fits well within 50000 iterations of the inner poll loop. */
+	/* Read with busy-wait timeout. 6 bytes × 10 bit-times at 1 Mbaud
+	 * fits well within 50000 iterations of the inner poll loop. */
 	for (uint32_t waited = 0;
-	     waited < 50000U && idx < LOOPBACK_PATTERN_LEN;
+	     waited < 50000U && idx < PING_PACKET_LEN;
 	     waited++) {
 		rc = uart_poll_in(lpuart3_dev, &c);
 		if (rc == 0) {
@@ -119,18 +138,18 @@ static bool run_loopback_test(uint32_t *const baud_out, uint32_t *const stat_out
 		}
 	}
 
-	/* Snapshot BAUD and STAT after the round-trip. */
-	if (baud_out) {
-		*baud_out = lpuart3_read(LPUART_BAUD_OFFSET);
-	}
-	if (stat_out) {
-		*stat_out = lpuart3_read(LPUART_STAT_OFFSET);
-	}
-
-	if (idx != LOOPBACK_PATTERN_LEN) {
+	if (idx != PING_PACKET_LEN) {
 		return false;
 	}
-	return memcmp(rx_buf, LOOPBACK_PATTERN, LOOPBACK_PATTERN_LEN) == 0;
+	/* Header must be 0xFF 0xFF. */
+	if (rx_buf[0] != 0xFF || rx_buf[1] != 0xFF) {
+		return false;
+	}
+	/* Responding ID is the third byte. */
+	if (resp_id_out) {
+		*resp_id_out = rx_buf[2];
+	}
+	return true;
 }
 
 /* ===========================================================================
@@ -195,32 +214,42 @@ static int print_boot_banner(void)
 
 void loopback_thread(void)
 {
-	uint32_t baud = 0U;
-	uint32_t stat = 0U;
 	uint32_t tick = 0U;
 
 	while (true) {
-		const bool ok = run_loopback_test(&baud, &stat);
+		/* Per-ID scan result. bit N set => ID N responded. */
+		uint8_t found_mask = 0U;
 
-		if (ok) {
-			/* Flood the PASS so it survives the LPUART2 collision
-			 * with the A55 Linux debug console. */
+		for (uint8_t id = PING_SCAN_ID_MIN; id <= PING_SCAN_ID_MAX; id++) {
+			uint8_t resp_id = 0U;
+			if (run_ping_test(id, &resp_id)) {
+				found_mask |= (uint8_t)(1U << id);
+			}
+		}
+
+		/* One summary line per tick — no flooding. */
+		if (found_mask != 0U) {
+			/* Build a human list of responding IDs. */
+			char ids[24] = {0};
+			int p = 0;
+			for (uint8_t id = PING_SCAN_ID_MIN; id <= PING_SCAN_ID_MAX; id++) {
+				if (found_mask & (1U << id)) {
+					if (p > 0) {
+						ids[p++] = ',';
+					}
+					ids[p++] = '0' + (char)id;
+				}
+			}
+			ids[p] = '\0';
 			for (int i = 0; i < 3; i++) {
-				printk("[%u] LPUART3: loopback OK "
-				       "BAUD=0x%08x STAT=0x%08x\n",
-				       (unsigned)tick, (unsigned)baud,
-				       (unsigned)stat);
+				printk("[%u] PING OK: ids={%s}\n",
+				       (unsigned)tick, ids);
 			}
 		} else {
-			/* No wire short (expected on the bench without a
-			 * loopback jumper) — log the BAUD so we can confirm
-			 * the rate is right. */
 			for (int i = 0; i < 3; i++) {
-				printk("[%u] LPUART3: loopback FAIL "
-				       "BAUD=0x%08x STAT=0x%08x "
-				       "(no GPIO_14<->GPIO_15 wire?)\n",
-				       (unsigned)tick, (unsigned)baud,
-				       (unsigned)stat);
+				printk("[%u] PING FAIL: no servo on IDs 1..%u\n",
+				       (unsigned)tick,
+				       (unsigned)PING_SCAN_ID_MAX);
 			}
 		}
 
