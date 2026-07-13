@@ -139,6 +139,139 @@ static inline uint32_t lpuart3_read(uint32_t offset)
 }
 
 /* ===========================================================================
+ * SCSCL register read/write helpers (raw packets).
+ * Hand-built so we don't pull in the SCSCL library (which previously
+ * crashed the SoC — see INIT_SOURCE_PROBLEM.md §2.3 and
+ * project-sc15-ping-bisect-2026-07-11.md).
+ * =========================================================================*/
+
+#define INST_PING   0x01U
+#define INST_READ   0x02U
+#define INST_WRITE  0x03U
+
+#define REG_TORQUE_ENABLE        40U
+#define REG_GOAL_TIME_L          44U
+#define REG_PRESENT_POSITION_L   56U
+
+static inline void drain_rx(void)
+{
+	unsigned char c;
+	while (uart_poll_in(lpuart3_dev, &c) == 0) { /* discard */ }
+}
+
+static void tx_packet(const uint8_t *pkt, size_t pkt_len)
+{
+	for (size_t i = 0; i < pkt_len; i++) {
+		uart_poll_out(lpuart3_dev, pkt[i]);
+	}
+}
+
+/* Read up to `n` bytes within `iters` polls. Inserts k_msleep(1) every
+ * 2000 iters to flush printk + yield kernel. */
+static uint32_t rx_bytes(uint8_t *out, size_t n, uint32_t iters)
+{
+	uint32_t idx = 0U;
+	for (uint32_t w = 0; w < iters && idx < n; w++) {
+		unsigned char c;
+		int rc = uart_poll_in(lpuart3_dev, &c);
+		if (rc == 0) {
+			out[idx++] = (uint8_t)c;
+		}
+		for (volatile int d = 0; d < 20; d++) {
+			__asm__ volatile("nop");
+		}
+		if ((w % 2000U) == 1999U) {
+			k_msleep(1);
+		}
+	}
+	return idx;
+}
+
+static bool write_reg(uint8_t id, uint8_t reg, const uint8_t *data, uint8_t data_len,
+		      uint8_t *err_out)
+{
+	drain_rx();
+	k_msleep(5);
+
+	const uint8_t len = (uint8_t)(3U + data_len);
+	uint8_t pkt[8 + 6];
+	uint8_t sum;
+	pkt[0] = 0xFF;
+	pkt[1] = 0xFF;
+	pkt[2] = id;
+	pkt[3] = len;
+	pkt[4] = INST_WRITE;
+	pkt[5] = reg;
+	sum = (uint8_t)(id + len + INST_WRITE + reg);
+	for (uint8_t i = 0; i < data_len; i++) {
+		pkt[6 + i] = data[i];
+		sum = (uint8_t)(sum + data[i]);
+	}
+	pkt[6 + data_len] = (uint8_t)~sum;
+	tx_packet(pkt, (size_t)(6U + data_len));
+
+	k_msleep(5);
+
+	uint8_t rx[6];
+	if (rx_bytes(rx, 6, 15000U) != 6) return false;
+	if (rx[0] != 0xFF || rx[1] != 0xFF) return false;
+	if (err_out) {
+		*err_out = rx[4];
+	}
+	return (rx[2] == id) && (rx[4] == 0U);
+}
+
+static bool write_reg_simple(uint8_t id, uint8_t reg, const uint8_t *data, uint8_t data_len)
+{
+	return write_reg(id, reg, data, data_len, NULL);
+}
+
+static bool read_reg(uint8_t id, uint8_t reg, uint8_t data_len, uint8_t *out)
+{
+	drain_rx();
+	k_msleep(5);
+
+	const uint8_t pkt[8] = {
+		0xFF, 0xFF, id, 0x04,
+		INST_READ, reg, data_len,
+		(uint8_t)~(id + 0x04U + INST_READ + reg + data_len)
+	};
+	tx_packet(pkt, 8);
+
+	k_msleep(5);
+
+	const size_t total = (size_t)(6U + data_len);
+	uint8_t rx[6 + 4];
+	if (rx_bytes(rx, total, 15000U) != total) return false;
+	if (rx[0] != 0xFF || rx[1] != 0xFF) return false;
+	if (rx[2] != id) return false;
+	if (out != NULL) {
+		for (uint8_t i = 0; i < data_len; i++) {
+			out[i] = rx[5U + i];
+		}
+	}
+	return true;
+}
+
+static uint16_t read_present_position(uint8_t id)
+{
+	uint8_t data[2] = {0, 0};
+	if (!read_reg(id, REG_PRESENT_POSITION_L, 2, data)) {
+		return UINT16_MAX;
+	}
+	return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static bool write_speed(uint8_t id, int16_t speed)
+{
+	const uint8_t data[2] = {
+		(uint8_t)(speed & 0xFFU),
+		(uint8_t)((speed >> 8) & 0xFFU)
+	};
+	return write_reg_simple(id, REG_GOAL_TIME_L, data, 2);
+}
+
+/* ===========================================================================
  * SC15 ping test — pure Zephyr (uart_poll_in / uart_poll_out).
  *
  * Send a 6-byte SCSCL PING targeted at one ID and try to read a 6-byte
@@ -307,6 +440,205 @@ void loopback_thread(void)
 K_THREAD_DEFINE(loopback_id, STACKSIZE, loopback_thread, NULL, NULL, NULL,
 		PRIORITY, 0, 0);
 
+/* ===========================================================================
+ * One-shot wheel-mode direction test (speed = -10, dur = 108 ms).
+ *
+ * Runs after the scan has had a chance to confirm the bus is alive.
+ * Skips the wheel-mode-entry dance — id=2 should already be in wheel mode
+ * from prior sessions (per project-sc15-discovery-2026-07-12.md). Reads
+ * PRESENT_POSITION, sends raw int16 speed=-10 (0xFFF6 LE) to GOAL_TIME_L,
+ * sleeps 108 ms, sends speed=0 stop, reads PRESENT_POSITION again.
+ *
+ * Calibration: 1° = 1218 PRESENT_POSITION units. speed=+10, dur=108ms
+ * gives ~5° LEFT (per 2026-07-12 calibration). If direction REVERSED,
+ * this test will show ~+5° delta (PRESENT_POSITION counts UP).
+ * =========================================================================*/
+
+#define TEST_ID          2U
+#define TEST_SPEED       (-10)
+#define TEST_DUR_MS      108U
+
+static void direction_test_thread(void)
+{
+	/* Let the boot banner + a few scan ticks happen first. */
+	k_msleep(3000);
+
+	for (int i = 0; i < 3; i++) {
+		printk("\n[TEST] === speed=%d, dur=%ums, target=id%u ===\n",
+		       (int)TEST_SPEED, (unsigned)TEST_DUR_MS, (unsigned)TEST_ID);
+	}
+
+	const uint16_t start_pos = read_present_position(TEST_ID);
+	for (int i = 0; i < 3; i++) {
+		if (start_pos == UINT16_MAX) {
+			printk("[FAIL] read PRESENT_POSITION (start)\n");
+		} else {
+			printk("[POS] start = %u\n", (unsigned)start_pos);
+		}
+	}
+	if (start_pos == UINT16_MAX) {
+		return;
+	}
+
+	/* Pre-flight: enable torque (reg 40). If torque is off, the servo
+	 * silently ignores all motion commands and may not even ACK. The
+	 * previous session noted "TORQUE OFF" after failed EPROM ops. */
+	uint8_t err_te = 0xFF;
+	for (int i = 0; i < 3; i++) {
+		const bool ok = write_reg(TEST_ID, REG_TORQUE_ENABLE,
+					 (uint8_t[]){1}, 1, &err_te);
+		if (ok) {
+			printk("[OK] torque_enable=1\n");
+		} else {
+			/* Servo might not ACK with torque off — try reading
+			 * PRESENT_TEMP just to confirm the bus is alive. */
+			uint8_t tmp = 0;
+			if (read_reg(TEST_ID, 63, 1, &tmp)) {
+				printk("[FAIL] torque_enable but temp=%u (bus OK)\n",
+				       (unsigned)tmp);
+			} else {
+				printk("[FAIL] torque_enable — no ACK, no bus, err=0x%02x\n",
+				       (unsigned)err_te);
+			}
+		}
+	}
+	k_msleep(50);
+
+	/* Diagnostic: write speed=0 (a "no-op" — should always succeed if
+	 * writes work at all). Captures the ERR byte to see what the servo
+	 * is complaining about for the real test. */
+	uint8_t err0 = 0xFF;
+	for (int i = 0; i < 3; i++) {
+		const bool ok = write_reg(TEST_ID, REG_GOAL_TIME_L,
+					 (uint8_t[]){0, 0}, 2, &err0);
+		if (ok) {
+			printk("[OK] write_speed=0 (probe)\n");
+		} else {
+			printk("[FAIL] write_speed=0 err=0x%02x\n", (unsigned)err0);
+		}
+	}
+	k_msleep(50);
+
+	/* Now the real test. First try multiple speed formats to figure out
+	 * which encoding the SC15 accepts:
+	 *   Format A: raw int16 -10  = [0xF6, 0xFF]
+	 *   Format B: abs + bit10    = 10 | (1<<10) = 0x40A = [0x0A, 0x04]
+	 *   Format C: raw int16 +10  = [0x0A, 0x00]
+	 * The user's session showed WritePWM() (which uses Format B) worked,
+	 * but raw int16 writes returned no ACK. */
+	uint8_t err_a = 0xFF, err_b = 0xFF, err_c = 0xFF;
+	write_reg(TEST_ID, REG_GOAL_TIME_L,
+		  (uint8_t[]){0xF6, 0xFF}, 2, &err_a);  /* Format A */
+	write_reg(TEST_ID, REG_GOAL_TIME_L,
+		  (uint8_t[]){0x0A, 0x04}, 2, &err_b);  /* Format B (bit10) */
+	write_reg(TEST_ID, REG_GOAL_TIME_L,
+		  (uint8_t[]){0x0A, 0x00}, 2, &err_c);  /* Format C */
+	for (int i = 0; i < 3; i++) {
+		printk("[PROBE] A=-10raw err=0x%02x  B=10|bit10 err=0x%02x  C=+10raw err=0x%02x\n",
+		       (unsigned)err_a, (unsigned)err_b, (unsigned)err_c);
+	}
+
+	/* If Format A (raw -10) succeeded — direction reversed. */
+	/* If Format B (abs + bit10) succeeded — direction unchanged with bit10. */
+	const bool sp_ok = (err_a == 0U);
+	(void)write_speed(TEST_ID, 0);  /* stop regardless */
+	for (int i = 0; i < 3; i++) {
+		if (sp_ok) {
+			const char *verdict = "FORMAT_A_WORKED (-10 raw ACK'd)";
+			if (err_b == 0U) {
+				verdict = "BOTH_A_AND_B_WORKED";
+			}
+			if (err_c == 0U) {
+				verdict = "ANY_WRITE_OKAY";
+			}
+			printk("[OK] %s\n", verdict);
+		} else {
+			if (err_b == 0U) {
+				printk("[OK] Format B (abs+bit10) ACK'd, raw neg doesn't\n");
+			} else {
+				if (err_c == 0U) {
+					printk("[OK] Format C (+10 raw) ACK'd — bit10 irrelevant\n");
+				} else {
+					if (err_a == 0xFF && err_b == 0xFF && err_c == 0xFF) {
+						printk("[FAIL] all 3 formats got no ACK\n");
+					} else {
+						char detail[64];
+						snprintk(detail, sizeof(detail),
+							"A=0x%02x B=0x%02x C=0x%02x",
+							(unsigned)err_a, (unsigned)err_b,
+							(unsigned)err_c);
+						printk("[FAIL] no format worked (%s)\n",
+						       detail);
+					}
+				}
+			}
+		}
+	}
+	for (int i = 0; i < 3; i++) {
+		if (sp_ok) {
+			printk("[OK] write_speed(id=%u, speed=%d) [0x%02x 0x%02x]\n",
+			       (unsigned)TEST_ID, (int)TEST_SPEED,
+			       (unsigned)((int16_t)TEST_SPEED & 0xFFU),
+			       (unsigned)(((int16_t)TEST_SPEED >> 8) & 0xFFU));
+		} else {
+			/* Re-issue with err capture to see what failed */
+			uint8_t err = 0xFF;
+			(void)write_reg(TEST_ID, REG_GOAL_TIME_L,
+					(uint8_t[]){
+					    (uint8_t)((int16_t)TEST_SPEED & 0xFFU),
+					    (uint8_t)(((int16_t)TEST_SPEED >> 8) & 0xFFU)
+					}, 2, &err);
+			printk("[FAIL] write_speed(id=%u, speed=%d) err=0x%02x\n",
+			       (unsigned)TEST_ID, (int)TEST_SPEED, (unsigned)err);
+		}
+	}
+	if (!sp_ok) {
+		return;
+	}
+
+	k_msleep(TEST_DUR_MS);
+
+	const bool st_ok = write_speed(TEST_ID, 0);
+	for (int i = 0; i < 3; i++) {
+		if (st_ok) {
+			printk("[OK] write_speed(id=%u, speed=0) [STOP]\n",
+			       (unsigned)TEST_ID);
+		} else {
+			uint8_t err = 0xFF;
+			(void)write_reg(TEST_ID, REG_GOAL_TIME_L,
+					(uint8_t[]){0, 0}, 2, &err);
+			printk("[FAIL] STOP write_speed err=0x%02x\n",
+			       (unsigned)err);
+		}
+	}
+
+	k_msleep(50);
+
+	const uint16_t end_pos = read_present_position(TEST_ID);
+	for (int i = 0; i < 3; i++) {
+		if (end_pos == UINT16_MAX) {
+			printk("[FAIL] read PRESENT_POSITION (end)\n");
+		} else {
+			int32_t delta = (int32_t)end_pos - (int32_t)start_pos;
+			if (delta > 32767) delta -= 65536;
+			if (delta < -32768) delta += 65536;
+			const char *verdict;
+			if (delta > 0) {
+				verdict = "REVERSED (speed=-10 went CW)";
+			} else if (delta < 0) {
+				verdict = "SAME (speed=-10 went CCW)";
+			} else {
+				verdict = "NO MOTION";
+			}
+			printk("[POS] end = %u  delta=%d (~%.2f deg)  %s\n",
+			       (unsigned)end_pos, (int)delta,
+			       (double)delta / 1218.0, verdict);
+		}
+	}
+}
+K_THREAD_DEFINE(test_id, STACKSIZE, direction_test_thread, NULL, NULL, NULL,
+		PRIORITY, 0, 0);
+
 int main(void)
 {
 	int rc = print_boot_banner();
@@ -315,6 +647,9 @@ int main(void)
 		while (true) {
 			k_msleep(1000);
 		}
+	}
+	while (true) {
+		k_msleep(1000);
 	}
 	return 0;
 }
