@@ -1,27 +1,5 @@
 /*
- * MobTurret M33 firmware — LPUART3 + console loopback (pure-Zephyr).
- *
- * Hardware targets (FRDM-iMX93, M33 core):
- *   - LPUART2 (console)  → /dev/ttyACM1 on the host
- *   - LPUART3 (servo bus) → GPIO_IO14 (TX), GPIO_IO15 (RX), 1 Mbaud
- *
- * Boot order (must match clock_control_mcux_ccm_rev2.c patches in the
- * MobTurret zephyr fork @ 4673670d075):
- *
- *   prio 0  — lpuart_clocks_init: open LPUART3 clock root + IP gate.
- *             LPUART2 root is opened later by Zephyr's mcux_lpuart driver
- *             when the console binds at prio 50.
- *   prio 50 — Zephyr LPUART driver binds, calls LPUART_Init(). The
- *             hal_nxp @ c7f1b8449 fork has the 1 Mbaud override in
- *             fsl_lpuart.c (lines 435 / 850) so BAUD = 0x17000001 directly.
- *   prio 7  — loopback_thread: every 1 s, scan-ping SCSCL IDs 1..5 on
- *             LPUART3 (via the Waveshare Bus Servo Adapter A) and log
- *             which IDs responded. Each ping is 6 bytes (well under
- *             the 16-byte RX FIFO).
- */
-
-/*
- * MobTurret M33 firmware — LPUART3 + console loopback (pure-Zephyr).
+ * MobTurret M33 firmware — LPUART3 servo scan (pure-Zephyr, ping-only).
  *
  * Hardware targets (FRDM-iMX93, M33 core):
  *   - LPUART2 (console)  → /dev/ttyACM1 on the host
@@ -29,13 +7,12 @@
  *
  * Boot order:
  *   prio 0  — imx93_m33_clock_init: SDK-direct clock root + IP gate
- *             bring-up for BOTH Lpuart2 (console) and Lpuart3 (servo).
+ *             bring-up for BOTH Lpuart2 (console) and Lpuart3 (servo bus).
  *             Zephyr's clock_control_mcux_ccm_rev2.c only sets the IP gate
  *             (CLOCK_EnableClock) — it does NOT call CLOCK_SetRootClock,
  *             so the clock root's OFF bit stays set. Without this hook,
  *             LPUART TX hangs on TDRE and trips the SoC watchdog.
- *             See git grep "Zephyr clock driver" in
- *             physical_gunbound/.../CLAUDE.md for the full diagnosis.
+ *             See gun_bot/INIT_SOURCE_PROBLEM.md §2.3 for the full diagnosis.
  *   prio 50 — Zephyr mcux_lpuart driver binds for LPUART2/LPUART3, calls
  *             LPUART_Init() with the baud-search loop.
  *   prio 60 — imx93_lpuart3_baud_fixup: forces BAUD = 0x17000001 by direct
@@ -43,6 +20,10 @@
  *             wrong (OSR, SBR) the SDK's baud-search may have produced.
  *   prio 7  — loopback_thread: every 1 s, scan-ping SCSCL IDs 1..5 on
  *             LPUART3 and log which IDs responded.
+ *
+ * Intentionally minimal-delta per gun_bot/SERVO_SETUP.md §2: no motion
+ * helpers, no SCSCL library, no GPIO, no range-test thread. Bus-presence
+ * only. Motion tests live in a separate firmware.
  */
 
 #include <zephyr/kernel.h>
@@ -81,9 +62,10 @@
  *   5     ~sum          checksum = ~(ID + Length + Instr), low byte
  *
  * Built per-ping in run_ping_test() so we can target different IDs. */
-#define PING_PACKET_LEN  6U
-#define PING_SCAN_ID_MIN 1U
-#define PING_SCAN_ID_MAX 5U
+#define INST_PING         0x01U
+#define PING_PACKET_LEN   6U
+#define PING_SCAN_ID_MIN  1U
+#define PING_SCAN_ID_MAX  5U
 
 static const struct device *const lpuart3_dev =
 	DEVICE_DT_GET(DT_NODELABEL(lpuart3));
@@ -164,9 +146,9 @@ static bool run_ping_test(uint8_t target_id, uint8_t *const resp_id_out)
 	while (uart_poll_in(lpuart3_dev, &c) == 0) { /* discard */ }
 
 	/* Build the SCSCL PING packet for this target ID. */
-	const uint8_t chk = (uint8_t)~(target_id + 0x02U + 0x01U);
+	const uint8_t chk = (uint8_t)~(target_id + 0x02U + INST_PING);
 	uint8_t pkt[PING_PACKET_LEN] = {
-		0xFF, 0xFF, target_id, 0x02, 0x01, chk
+		0xFF, 0xFF, target_id, 0x02, INST_PING, chk
 	};
 
 	/* TX packet byte-by-byte. */
@@ -203,60 +185,8 @@ static bool run_ping_test(uint8_t target_id, uint8_t *const resp_id_out)
 }
 
 /* ===========================================================================
- * Main thread — runs once, prints banner + initial state, then a worker
- * thread handles the loopback loop.
+ * Worker thread: every 1 s, ping IDs 1..5 in order, log who responded.
  * =========================================================================*/
-
-static int print_boot_banner(void)
-{
-	uint32_t baud = lpuart3_read(LPUART_BAUD_OFFSET);
-	uint32_t stat = lpuart3_read(LPUART_STAT_OFFSET);
-
-	if (!device_is_ready(lpuart3_dev)) {
-		printk("BOOT FAIL: lpuart3 device not ready\n");
-		return -ENODEV;
-	}
-
-	/* Clock root prio 0 hook (imx93_m33_clock_init) must have run before
-	 * main(). After the prio 60 baud_fixup hook, BAUD should be 0x17000001. */
-	if (baud == 0U) {
-		printk("BOOT FAIL: LPUART3 BAUD=0 (clock root not configured)\n");
-		return -ENODEV;
-	}
-
-	/* Expected BAUD at 24 MHz clock, OSR=23, SBR=1:
-	 *   BAUD = (OSR-1) << 24 | SBR = (23 << 24) | 1 = 0x17000001. */
-	const bool baud_ok = (baud == 0x17000001U);
-
-	printk("\n");
-	printk("============================================================\n");
-	printk(" MobTurret M33 firmware — LPUART3 @ 1 Mbaud\n");
-	printk(" Zephyr SDK 1.0.1 / GCC 14.3.0\n");
-	printk(" Console: LPUART2 -> /dev/ttyACM1 (host)\n");
-	printk(" Servo bus: LPUART3 @ 0x%08x, GPIO_IO14/IO15\n",
-	       (unsigned)LPUART3_BASE);
-	printk("------------------------------------------------------------\n");
-	printk(" LPUART3 BAUD  = 0x%08x %s\n",
-	       (unsigned)baud, baud_ok ? "(1 Mbaud OK)" : "(NOT 1 Mbaud!)");
-	printk(" LPUART3 STAT  = 0x%08x\n", (unsigned)stat);
-	/* Common STAT bits: TDRE=1<<23, TC=1<<22, RDRF=1<<21, OR=1<<19, ... */
-	if (stat & (1U << 19)) {
-		printk("   ! STAT[OR] overrun flag set\n");
-	}
-	if (stat & (1U << 16)) {
-		printk("   ! STAT[LBKDIF] LIN break detect\n");
-	}
-	if (stat & (1U << 15)) {
-		printk("   ! STAT[MA1F] match-1\n");
-	}
-	if (stat & 0x000F0000U) {
-		/* Clear any latched error flags (W1C). */
-		*(volatile uint32_t *)(LPUART3_BASE + LPUART_STAT_OFFSET) =
-			0x000F0000U;
-	}
-	(void)baud_ok;
-	return 0;
-}
 
 void loopback_thread(void)
 {
@@ -307,6 +237,61 @@ void loopback_thread(void)
 K_THREAD_DEFINE(loopback_id, STACKSIZE, loopback_thread, NULL, NULL, NULL,
 		PRIORITY, 0, 0);
 
+/* ===========================================================================
+ * Main thread — runs once, prints banner + initial state, then sleeps.
+ * =========================================================================*/
+
+static int print_boot_banner(void)
+{
+	uint32_t baud = lpuart3_read(LPUART_BAUD_OFFSET);
+	uint32_t stat = lpuart3_read(LPUART_STAT_OFFSET);
+
+	if (!device_is_ready(lpuart3_dev)) {
+		printk("BOOT FAIL: lpuart3 device not ready\n");
+		return -ENODEV;
+	}
+
+	/* Clock root prio 0 hook (imx93_m33_clock_init) must have run before
+	 * main(). After the prio 60 baud_fixup hook, BAUD should be 0x17000001. */
+	if (baud == 0U) {
+		printk("BOOT FAIL: LPUART3 BAUD=0 (clock root not configured)\n");
+		return -ENODEV;
+	}
+
+	/* Expected BAUD at 24 MHz clock, OSR=23, SBR=1:
+	 *   BAUD = (OSR-1) << 24 | SBR = (23 << 24) | 1 = 0x17000001. */
+	const bool baud_ok = (baud == 0x17000001U);
+
+	printk("\n");
+	printk("============================================================\n");
+	printk(" MobTurret M33 firmware — LPUART3 @ 1 Mbaud (ping-only)\n");
+	printk(" Zephyr SDK 1.0.1 / GCC 14.3.0\n");
+	printk(" Console: LPUART2 -> /dev/ttyACM1 (host)\n");
+	printk(" Servo bus: LPUART3 @ 0x%08x, GPIO_IO14/IO15\n",
+	       (unsigned)LPUART3_BASE);
+	printk("------------------------------------------------------------\n");
+	printk(" LPUART3 BAUD  = 0x%08x %s\n",
+	       (unsigned)baud, baud_ok ? "(1 Mbaud OK)" : "(NOT 1 Mbaud!)");
+	printk(" LPUART3 STAT  = 0x%08x\n", (unsigned)stat);
+	/* Common STAT bits: TDRE=1<<23, TC=1<<22, RDRF=1<<21, OR=1<<19, ... */
+	if (stat & (1U << 19)) {
+		printk("   ! STAT[OR] overrun flag set\n");
+	}
+	if (stat & (1U << 16)) {
+		printk("   ! STAT[LBKDIF] LIN break detect\n");
+	}
+	if (stat & (1U << 15)) {
+		printk("   ! STAT[MA1F] match-1\n");
+	}
+	if (stat & 0x000F0000U) {
+		/* Clear any latched error flags (W1C). */
+		*(volatile uint32_t *)(LPUART3_BASE + LPUART_STAT_OFFSET) =
+			0x000F0000U;
+	}
+	(void)baud_ok;
+	return 0;
+}
+
 int main(void)
 {
 	int rc = print_boot_banner();
@@ -315,6 +300,9 @@ int main(void)
 		while (true) {
 			k_msleep(1000);
 		}
+	}
+	while (true) {
+		k_msleep(1000);
 	}
 	return 0;
 }

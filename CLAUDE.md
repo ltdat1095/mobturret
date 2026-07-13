@@ -113,8 +113,16 @@ Do not redefine the wire format in a subproject. Change the canonical
 - `design.md` — full system architecture (MQTT topics, DynamoDB schema,
   mobile workflows). **The source of truth for what MobTurret is.**
 - `IPC.md` — A55 ↔ M33 RPMsg wire contract.
-- `gun_bot/CLAUDE.md`, `gun_bot/IPC.md`, `gun_bot/TROUBLESHOOTING.md`
-  — M33 firmware deep-dive.
+- `gun_bot/CLAUDE.md`, `gun_bot/IPC.md` — M33 firmware deep-dive.
+- `gun_bot/HOW_TO_DEBUG.md` — **the operational playbook for
+  deploying and testing M33 firmware on real hardware** (build →
+  scp → remoteproc → crash check → console → recovery). Read this
+  before you touch the board.
+- `gun_bot/SERVO_SETUP.md` — SC15 servo bus bring-up record, SCSCL
+  protocol notes, and the **§0 motion safety envelope** (hard caps
+  on speed/duration — servos have already been damaged twice).
+- `gun_bot/INIT_SOURCE_PROBLEM.md` — root-cause archaeology for the
+  LPUART3 baud / SoC-crash / printk problems and their fixes.
 
 ---
 

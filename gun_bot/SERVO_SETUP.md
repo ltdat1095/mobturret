@@ -1,5 +1,143 @@
 # Servo setup — FRDM-iMX93 M33 ↔ Waveshare Bus Servo Adapter (A) ↔ SC15 × 2
 
+## 0. SAFETY PROTOCOL for motion testing (READ FIRST)
+
+The SC15 servos on the bench have a **narrow verified-safe envelope**.
+Anything outside it can physically break the horn mounting, strip the
+gears, or latch a permanent fault state. This section is non-negotiable.
+
+### 0.1 Hard caps — DO NOT EXCEED
+
+| Parameter | Hard cap | Source |
+|---|---|---|
+| Speed command value (bytes to GOAL_TIME_L) | **≤ 10** | User-calibrated 2026-07-12 |
+| Duration of one motion step | **≤ 108 ms** | User-calibrated 2026-07-12 |
+| Steps per test session (one direction) | **≤ 20** | User-calibrated 2026-07-12 (80° total) |
+| Cumulative motion per session | **≤ 80°** (≈ 97,440 PRESENT_POSITION units) | User-measured 80° in 20×108ms |
+
+**Do NOT extrapolate.** speed=50 for 200ms was tried twice (2026-07-13
+session v18 + v19) and **broke hardware both times** — id=1 jumped 58,878
+units in 3 s, id=2 entered a fault state. The SC15 firmware's speed-to-
+rotation mapping is NOT linear with my assumed units, so any value
+beyond speed=10 is unverified and unsafe.
+
+### 0.2 Step-by-step only — NO single max-range attempts
+
+Every motion test **must** be a sequence of small steps with verification
+between each. Specifically:
+
+```
+for step in 1..MAX_STEPS_PER_SESSION:
+    1. Read PRESENT_POSITION (start_pos)
+    2. Send speed=10, dur=108 ms
+    3. Wait 150 ms (motion + bus settle)
+    4. Send stop (speed=0)
+    5. Read PRESENT_POSITION (end_pos)
+    6. Read PRESENT_SPEED (should be 0 = stopped)
+    7. Compute delta = end_pos - start_pos (handle 16-bit wraparound)
+    8. ABORT conditions (see §0.3) — if any triggered, STOP immediately
+    9. Optional: read PRESENT_TEMP, PRESENT_LOAD, PRESENT_VOLTAGE
+   10. k_msleep(100) — settle before next step
+```
+
+The total motion per session is the **sum** of the per-step deltas,
+across at most 20 steps. A single 3 s motion command is **never**
+acceptable — that's exactly what caused the 2026-07-13 double-fault.
+
+### 0.3 Abort conditions — STOP IMMEDIATELY if any is true
+
+1. **PRESENT_SPEED > 0 unexpectedly** (e.g., you commanded stop but
+   servo is still turning) → STOP, send speed=0 again, halt test.
+2. **PRESENT_SPEED = 0 during a motion command** → STOP. The servo
+   should be rotating; if it's not, something is wrong (stuck,
+   faulted, no torque). Do NOT keep sending motion commands.
+3. **|delta| > 2 × expected** (expected ≈ 5,069..6,912 units per step
+   per the 2026-07-12 calibration; cap = 14,000) → STOP. Wild
+   jumps like the 58,878-unit excursion in v19 mean the servo is
+   responding to something we didn't command.
+4. **PING fails** (no ACK within 2,000 polls) → STOP. Servo has
+   entered a fault state (same pattern as 2026-07-12's speed=1500
+   incident).
+5. **PRESENT_TEMP > 60 °C** → STOP, let servo cool before retrying.
+6. **PRESENT_VOLTAGE < 4.5 V or > 8.5 V** (SC15 spec is 6..8.4 V
+   typical) → STOP, check power supply.
+
+When an abort fires: (a) send stop, (b) re-enable torque only if it
+was disabled, (c) print the failure reason over the console so the
+host sees it, (d) halt the test thread (let main loop continue).
+
+### 0.4 Pre-flight checklist (run before any motion test)
+
+For each servo id you'll be moving:
+
+1. **PING** — must respond within 2,000 polls.
+2. **Read firmware version** (reg 0, reg 1). Confirm it's 0.5 (the
+   firmware version we have documented register maps for). Anything
+   else, abort.
+3. **Read MIN_ANGLE_LIMIT_L and MAX_ANGLE_LIMIT_L** (reg 9, 11).
+   - Both = 0 → wheel mode (good for continuous rotation)
+   - Non-zero, non-trivial → position mode (use `WritePos` for motion)
+4. **Read TORQUE_ENABLE** (reg 40). If 0, write 1 (with retry).
+5. **Read PRESENT_TEMP** (reg 63). Must be < 60 °C. If higher,
+   halt and cool down.
+6. **Read PRESENT_VOLTAGE** (reg 62). Must be in 4.5..8.5 V range.
+
+### 0.5 Hard-coded safety constants (firmware)
+
+The M33 firmware **must** declare these as constants and use them
+in every motion command, so that no future test can accidentally
+exceed the envelope without a code change:
+
+```c
+/* Hard-coded safety envelope. DO NOT CHANGE without first running
+ * the calibration protocol in §0.6 and confirming with the user. */
+#define MAX_SAFE_SPEED        10U      /* bytes to GOAL_TIME_L */
+#define MAX_SAFE_DUR_MS       108U     /* per step */
+#define MAX_STEPS_PER_SESSION 20U      /* ~80° cumulative */
+#define MAX_DELTA_PER_STEP    14000    /* ~2x expected upper bound */
+#define PRESENT_SPEED_TIMEOUT_MS 250U  /* wait time after stop command */
+```
+
+Any future motion command that doesn't use these constants is a bug
+and should be rejected in code review.
+
+### 0.6 Calibration protocol (only if §0.1 caps prove insufficient)
+
+The user's 2026-07-12 calibration is the binding baseline. To safely
+extend it (e.g., to find a higher speed cap):
+
+1. **Pick one new parameter to vary**. Hold all others at the
+   verified-safe baseline (speed=10, dur=108 ms).
+2. **Make the change tiny**. E.g., speed=10→11, or dur=108→110.
+3. **Run a single step**. Verify PRESENT_SPEED is ~expected, |delta|
+   is in expected range, PRESENT_TEMP didn't spike.
+4. **Run three more steps** at the same new value to check
+   consistency.
+5. **If all four steps look good**, update the cap in firmware, log
+   the change in this doc with date + measured delta.
+6. **If any step looks wrong**, revert to the previous cap.
+
+Never try to skip ahead (e.g., speed=10 → 50 in one jump). Each
+calibration step must be tiny and verified.
+
+### 0.7 Why this protocol exists
+
+History of failures (motivating the safety rules):
+
+- **2026-07-12 discovery**: user ran speed=1500 for 2 s on id=2.
+  Hardware was damaged, fault state latched. id=2 has been flaky ever
+  since.
+- **2026-07-13 v18 test**: ran speed=50 for 100 ms — safe (508 units).
+- **2026-07-13 v19 test**: ran speed=50 for 3 s on **both** id=1
+  and id=2 — id=1 jumped 58,878 units in 3 s, id=2 entered fault
+  state. Same failure mode as the 2026-07-12 incident.
+
+The cap of **speed=10, dur=108 ms** is the ONLY empirically-validated
+safe combination. Everything beyond it is unsafe until proven
+otherwise by the §0.6 calibration protocol.
+
+---
+
 This is the bring-up record for the **servo bus** half of MobTurret. It
 documents the hardware, wiring, firmware, and verification of two SC15
 servos driven from the M33's LPUART3 at 1 Mbaud via a Waveshare Bus
@@ -248,7 +386,111 @@ and gets its own bring-up.
 
 ---
 
-## 7. Cheatsheet
+## 7. Direction control (wheel mode) — VERIFIED 2026-07-13
+
+The SC15 has two operating modes, controlled by the angle-limit
+registers (MIN_ANGLE_LIMIT_L=9, MAX_ANGLE_LIMIT_L=11):
+
+- **Position mode** (MIN ≠ 0, MAX ≠ 0): bounded rotation to a
+  target position via `SCSCL::WritePos(id, pos, time, speed)`.
+  Direction is determined by `target − current`.
+- **Wheel mode** (MIN = MAX = 0): continuous rotation at a
+  controlled speed. Used for the gun_bot's "spin the blaster" /
+  "track a target" use cases.
+
+### Speed encoding (wheel mode)
+
+Speed commands go to **GOAL_TIME_L** (register 44) as **2 LE bytes**:
+
+| Bytes (LE) | uint16 value | Direction |
+|---|---|---|
+| `[speed, 0x00]` | `speed` (0..1000) | **CW**  (one rotation direction) |
+| `[speed, 0x04]` | `speed \| (1<<10)` | **CCW** (opposite direction) |
+| `[0, 0]`         | `0`               | **stop** |
+
+**Verified empirically** (`zephyr_v18.elf` test, id=2, speed=50, dur=100ms):
+- `[0x32, 0x00]` → position went +508 (CW)
+- `[0x32, 0x04]` → position went −508 (CCW)
+
+This matches the `SCSCL::WritePWM` convention exactly:
+
+```c
+int SCSCL::WritePWM(u8 ID, s16 pwmOut)
+{
+    if (pwmOut < 0) {
+        pwmOut = -pwmOut;            // take absolute value
+        pwmOut |= (1<<10);            // set bit 10 as direction flag
+    }
+    u8 bBuf[2];
+    Host2SCS(bBuf+0, bBuf+1, pwmOut);
+    return genWrite(ID, SCSCL_GOAL_TIME_L, bBuf, 2);
+}
+```
+
+### M33 implementation (gun_bot IPC)
+
+Pass a signed `int16_t speed` from the A55; encode as the SCSCL
+library does:
+
+```c
+static bool do_write_speed(uint8_t id, int16_t speed)
+{
+    uint16_t enc = (speed < 0)
+        ? ((uint16_t)(-speed) | (1u << 10))   /* abs + bit10 = reverse */
+        : (uint16_t)speed;                    /* positive = forward */
+    uint8_t data[2] = {
+        (uint8_t)(enc & 0xFFU),
+        (uint8_t)((enc >> 8) & 0xFFU)
+    };
+    return do_write_n(id, 44, data, 2);  /* GOAL_TIME_L = 44 */
+}
+```
+
+Caller passes:
+- `do_write_speed(id, 0)` → stop
+- `do_write_speed(id, +N)` → CW at speed N
+- `do_write_speed(id, -N)` → CCW at speed N
+
+### Important: do NOT send raw negative int16
+
+Earlier sessions tried sending `-10` directly as `[0xF6, 0xFF]` and
+saw no motion. **That is not the right encoding** — the SC15
+firmware (v0.5) treats the high byte as a mode/magnitude word, not
+as a sign extension. Always go through the abs + bit10 conversion.
+
+### Pre-flight (wheel mode entry, once per servo)
+
+```c
+/* 1. Unlock EPROM */
+do_write_1(id, 48, 0);                              /* LOCK = 0 */
+/* 2. Write 4 zero bytes starting at MIN_ANGLE_LIMIT_L (reg 9) */
+do_write_n(id, 9, (uint8_t[]){0,0,0,0}, 4);        /* MIN=MAX=0 */
+/* 3. Lock EPROM */
+do_write_1(id, 48, 1);                              /* LOCK = 1 */
+```
+
+After wheel mode is active, `do_write_speed()` rotates the servo
+per the encoding above.
+
+### Calibration guidance
+
+Speed magnitude `N` is interpreted as **step/s** by the SC15 firmware
+(per `SCS_Series_Memory_Table_Analysis.xls`, register 0x2E "Operation
+speed", range 0..1000). At 1° = 1218 PRESENT_POSITION units (user-measured
+2026-07-12), a speed of 10 step/s for 108 ms gives ~5° of motion
+(5069..6912 units). This is the **only** empirically-verified safe
+combination. See **§0 Safety Protocol** for hard caps and the
+step-by-step motion discipline.
+
+Empirically (calibrated 2026-07-12):
+- speed=10, dur=108ms → 5069..6912 units (~4.2°..5.7°) ✓ safe
+- speed=10, dur=200ms → 25600 units (~21°) ✓ safe (2× the calibrated dur)
+- speed=50 for any duration > 100ms → **UNSAFE** (broke id=1+id=2 in
+  the 2026-07-13 v19 test — see §0.7)
+
+---
+
+## 8. Cheatsheet
 
 ```bash
 # Build + deploy scan firmware

@@ -5,6 +5,15 @@ servo-bus firmware on real hardware. It covers the full cycle —
 build, deploy, monitor, debug, recover — and was written after the
 2026-07-11 session that brought up the SC15 servo bus.
 
+**Status: re-verified end-to-end on 2026-09-02.** The §3 deploy
+sequence and §5 console capture work as written. Two deltas found
+that run: the bus now answers `ids={2}` only (id=1 is silent — see
+§5), and §10 issue #1 is fixed (see §10).
+
+This doc is linked from [`../CLAUDE.md`](../CLAUDE.md) and
+[`./CLAUDE.md`](./CLAUDE.md). If you add a hardware procedure, add it
+here rather than starting a new file.
+
 For the project context see [`../CLAUDE.md`](../CLAUDE.md). For the
 servo-bus wiring / SCSCL protocol details see
 [`./SERVO_SETUP.md`](./SERVO_SETUP.md). For the A55 ↔ M33 wire
@@ -89,6 +98,33 @@ EOF
 If `echo stop` returns `Device or resource busy`, the previous M33 is
 still tearing down — re-run the loop.
 
+### Two things that make this go smoothly
+
+**1. Diff before you deploy.** `/lib/firmware/` has 80+ `zephyr*.elf`
+files from past sessions, and it's easy to redeploy a binary you
+already tested. Compare first:
+
+```bash
+md5sum gun_bot/m33_firmware/gun_controller/debug/zephyr/zephyr.elf
+ssh root@192.168.1.94 'md5sum /lib/firmware/zephyr_<candidate>.elf'
+```
+
+Matching md5 means this exact firmware already ran on the board —
+useful for knowing whether you're re-testing a known quantity or
+booting something new. Name new uploads with a date
+(`zephyr_ping_20260902.elf`), not another `_v N`.
+
+**2. Start the console reader BEFORE `echo start`.** The boot banner
+prints once, within the first second. If you attach to `/dev/ttyACM1`
+after starting the M33, you miss the banner (and therefore the
+`BAUD =` line that tells you whether the clock hooks worked) and see
+only the periodic scan ticks. Launch the §5 reader in the background
+first, then run the stop/start sequence.
+
+Note `echo ... > .../firmware` takes a path *relative to
+`/lib/firmware`* — `zephyr_ping_20260902.elf`, not the absolute path.
+Both happen to work, but `cat firmware` echoes back what you wrote.
+
 ---
 
 ## 4. The crash signal: A55 wifi drop
@@ -112,6 +148,27 @@ A crash looks like:
 4 packets transmitted, 0 received, +DUP, 100% packet loss
 ```
 
+Confirm the other direction too — a healthy start logs this on the A55
+(`dmesg | grep -E "remoteproc|imx-rproc"`):
+
+```
+remoteproc remoteproc0: powering up imx-rproc
+remoteproc remoteproc0: Booting fw image zephyr_ping_20260902.elf, size 719420
+remoteproc remoteproc0: No resource table in elf
+remoteproc remoteproc0: remote processor imx-rproc is now up
+```
+
+`No resource table in elf` is **expected and harmless** for the
+current firmware — it just means no RPMsg/virtio vrings are declared
+yet. It becomes a real error only once [`./IPC.md`](./IPC.md) RPMsg
+lands, which needs a `.resource_table` section.
+
+Ping at T+0, T+30 s, and once a few minutes later. The 2026-07-13
+crashes killed wifi within seconds, but the watchdog reboot in
+[`./INIT_SOURCE_PROBLEM.md`](./INIT_SOURCE_PROBLEM.md) §1 case 3
+arrived ~10 minutes after `echo start` — an early pass alone is not
+proof of stability.
+
 ---
 
 ## 5. Monitor M33 console
@@ -131,20 +188,45 @@ print(total.decode('utf-8', errors='replace'))
 "
 ```
 
-Common boot output (HEAD scan firmware):
+Common boot output (HEAD scan firmware, captured 2026-09-02):
 ```
 ============================================================
- MobTurret M33 firmware — LPUART3 @ 1 Mbaud
+ MobTurret M33 firmware — LPUART3 @ 1 Mbaud (ping-only)
  Zephyr SDK 1.0.1 / GCC 14.3.0
  Console: LPUART2 -> /dev/ttyACM1 (host)
  Servo bus: LPUART3 @ 0x42570000, GPIO_IO14/IO15
 ------------------------------------------------------------
  LPUART3 BAUD  = 0x17000001 (1 Mbaud OK)
- LPUART3 STAT  = 0x00800000
-[0] PING OK: ids={1,2}
-[1] PING OK: ids={1,2}
+ LPUART3 STAT  = 0x00c00000
+[0] PING OK: ids={2}
+[1] PING OK: ids={2}
 ...
 ```
+
+What to read from the banner:
+
+- `LPUART3 BAUD  = 0x17000001` — the SDK's baud-search loop agreed
+  with the 1 Mbaud override in the `hal_nxp` fork; clock root
+  + baud fixup are working. If this is anything else, the LPUART3
+  clock hook from [`./INIT_SOURCE_PROBLEM.md`](./INIT_SOURCE_PROBLEM.md)
+  §2.3 didn't run — do not expect the SC15s to answer.
+- `LPUART3 STAT  = 0x00c00000` — bits 23 (TDRE) and 22 (TC) set,
+  i.e. the TX holding register is empty and the TX shift register
+  finished. No overrun (bit 19), no break, no match-1 — clean.
+- `PING OK: ids={N}` — broadcast ping every 1 s; `N` is the set of
+  SC15 IDs that answered. On 2026-09-02 only `{2}` answered
+  (id=1 has been silent since the 2026-07-13 v19 over-speed
+  incident). If your session shows `{1,2}` and a different STAT
+  value, that's also fine — anything in `{1,2}` with no FAIL
+  lines is a healthy bus. **The 16-byte RX FIFO** (see
+  [`./INIT_SOURCE_PROBLEM.md`](./INIT_SOURCE_PROBLEM.md) §2.4)
+  is plenty for these 6-byte pings.
+
+A SCAN firmware (the previous head, with the
+direction-test helpers still in `main.cpp`) prints the same banner
+*without* "(ping-only)" and adds `[TEST]` / `[POS]` / `[OK]`
+lines after the scan. See [`./SERVO_SETUP.md`](./SERVO_SETUP.md)
+for the format of motion-test output.
 
 Capture for as long as you need — the kernel blocks forever in the
 scan thread; you can capture 60 s and still see live ticks.
@@ -212,13 +294,19 @@ ssh root@192.168.1.94 ls -la /lib/firmware/zephyr*.elf
 
 ## 8. Safety checks for servo motion
 
+> **Authoritative source:** [`./SERVO_SETUP.md`](./SERVO_SETUP.md) **§0
+> "SAFETY PROTOCOL"** — hard caps, abort conditions, pre-flight
+> checklist, calibration protocol, and failure history. This section
+> is the *operational* layer; the §0 doc is the *contract*.
+
 The servo bus is half-duplex at 1 Mbaud. Each `WritePos` packet is
 **13 bytes**; each `WriteByte` is **8 bytes**. The M33 RX FIFO is **16
-bytes deep** (see
-[`./INIT_SOURCE_PROBLEM.md`](./INIT_SOURCE_PROBLEM.md) §2.4). Sticking
-a stuck servo at a mechanical limit draws current, heats up, and can
-break the horn mounting — the SC15 got to **64 °C** during one
-violent back-and-forth test (max safe ~50 °C).
+bytes deep** (see [`./INIT_SOURCE_PROBLEM.md`](./INIT_SOURCE_PROBLEM.md)
+§2.4). Sticking a stuck servo at a mechanical limit draws current,
+heats up, and can break the horn mounting — the SC15 got to **64 °C**
+during one violent back-and-forth test (max safe ~50 °C). Twice
+the harness has been damaged by extrapolating beyond the verified
+envelope (see [`./SERVO_SETUP.md`](./SERVO_SETUP.md) §0.7).
 
 **Pre-flight checklist before any motion:**
 
@@ -230,6 +318,11 @@ violent back-and-forth test (max safe ~50 °C).
 6. **Set SPEED = 0** to let TIME govern the move (don't impose a speed cap).
 7. **Watch the loop**: alternate target by a small amount (±2000–5000) and check that actual ≈ target ± some delta. If actual doesn't track, the servo is stuck — stop pushing.
 8. **Cap motion duration**: never run alternating targets faster than 1 Hz. Sustained reversal at 0.5 Hz with TIME=1500 ms is enough to damage horns.
+9. **Confirm the speed/duration is inside the §0 hard caps** —
+   `MAX_SAFE_SPEED = 10`, `MAX_SAFE_DUR_MS = 108`,
+   `MAX_STEPS_PER_SESSION = 20`, `MAX_DELTA_PER_STEP = 14000`. These
+   constants must be declared in the M33 source and used by every
+   motion command (no magic numbers in the firmware).
 
 **If temp spikes > 55 °C**:
 - Disable torque (`SCSCL_TORQUE_ENABLE = 0`)
@@ -283,14 +376,23 @@ print(total.decode('utf-8', errors='replace'))
 
 ---
 
-## 10. Open issues (from 2026-07-11 session)
+## 10. Issue history (working off the 2026-07-11 list)
 
-1. **GPIO / SCSCL library additions crash the SoC** (still unsolved).
-   The minimal firmware (no GPIO, no SCSCL library, hand-built SCSCL
-   packets) works reliably. Adding `GPIO_DT_SPEC_GET` at file scope
-   or instantiating `static SCSCL servo;` and calling `servo.begin()`
-   causes A55 wifi to drop within seconds of `echo start`. Bisect in
-   progress.
+1. **GPIO / SCSCL library additions crash the SoC** —
+   **RESOLVED 2026-07-13**. Root cause was the missing
+   `CLOCK_SetRootClock` for the LPUART3 clock root, not GPIO or
+   SCSCL itself. Fixed via the SDK-direct clock-init SYS_INIT hook
+   (`imx93_m33_clock_init`) at PRE_KERNEL_1 prio 0. The motion
+   firmware in this repo's `src/main.cpp` (before today's ping-only
+   revert) ran `write_reg` / `read_reg` / `WritePWM` with hand-built
+   packets and never crashed the SoC after the fix. See
+   [`./INIT_SOURCE_PROBLEM.md`](./INIT_SOURCE_PROBLEM.md) §2.3
+   for the full diagnosis and the bisect table in
+   `project-m33-build-bisect-2026-07-09.md` for the failed
+   experiments. The ping-only firmware shipped 2026-09-02 is the
+   **bus-presence minimum** — re-add motion by porting helpers from
+   a `git log -p` of `src/main.cpp` (the direction-test thread in
+   the v19 era is the reference).
 2. **`rx_packet` infinite-loop bug.** Fixed in current firmware. The
    original `rx_packet` would spin forever on a single missed byte
    (the inner timeout fired but the outer `while` loop kept going
@@ -307,3 +409,9 @@ print(total.decode('utf-8', errors='replace'))
 5. **Position register is 16-bit** (not the standard 12-bit SC15).
    See [`./SERVO_SETUP.md`](./SERVO_SETUP.md) §5. Range is configured
    in EPROM at MIN/MAX_ANGLE_LIMIT (registers 9, 11).
+6. **id=1 silent on the bus** — observed 2026-09-02: the scan
+   reports `ids={2}` only. id=1 has not answered ping since the
+   2026-07-13 v19 over-speed event (58,878-unit excursion in 3 s).
+   Likely faulted. To rule out a renumbered ID, widen
+   `PING_SCAN_ID_MAX` in `src/main.cpp` from `5U` to `253U` and
+   re-deploy — still ping-only, no motion.
