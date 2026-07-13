@@ -20,17 +20,50 @@
  *             the 16-byte RX FIFO).
  */
 
+/*
+ * MobTurret M33 firmware — LPUART3 + console loopback (pure-Zephyr).
+ *
+ * Hardware targets (FRDM-iMX93, M33 core):
+ *   - LPUART2 (console)  → /dev/ttyACM1 on the host
+ *   - LPUART3 (servo bus) → GPIO_IO14 (TX), GPIO_IO15 (RX), 1 Mbaud
+ *
+ * Boot order:
+ *   prio 0  — imx93_m33_clock_init: SDK-direct clock root + IP gate
+ *             bring-up for BOTH Lpuart2 (console) and Lpuart3 (servo).
+ *             Zephyr's clock_control_mcux_ccm_rev2.c only sets the IP gate
+ *             (CLOCK_EnableClock) — it does NOT call CLOCK_SetRootClock,
+ *             so the clock root's OFF bit stays set. Without this hook,
+ *             LPUART TX hangs on TDRE and trips the SoC watchdog.
+ *             See git grep "Zephyr clock driver" in
+ *             physical_gunbound/.../CLAUDE.md for the full diagnosis.
+ *   prio 50 — Zephyr mcux_lpuart driver binds for LPUART2/LPUART3, calls
+ *             LPUART_Init() with the baud-search loop.
+ *   prio 60 — imx93_lpuart3_baud_fixup: forces BAUD = 0x17000001 by direct
+ *             register write, AFTER the driver has run. This bypasses any
+ *             wrong (OSR, SBR) the SDK's baud-search may have produced.
+ *   prio 7  — loopback_thread: every 1 s, scan-ping SCSCL IDs 1..5 on
+ *             LPUART3 and log which IDs responded.
+ */
+
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/uart.h>
-#include <zephyr/drivers/clock_control.h>
 #include <zephyr/init.h>
 #include <zephyr/sys/printk.h>
-#include <zephyr/dt-bindings/clock/imx_ccm_rev2.h>
 
+#include <fsl_clock.h>    /* SDK clock root + IP gate control */
 #include <fsl_lpuart.h>   /* pulls in MIMX9352_cm33_COMMON.h with LPUART3_BASE */
 
 #include <string.h>
+
+/* LPUART3 base for the M33 non-secure view. Matches the DTS overlay's
+ * `reg` property and the SC15 servo bus pinout. */
+#define LPUART3_BASE_NS        0x42570000UL
+
+/* BAUD register value for 1 Mbaud at 24 MHz Lpuart3 clock root:
+ *   OSR = 23 (bits 28:24), SBR = 1 (bits 12:0)
+ *   baud = 24e6 / ((OSR + 1) * SBR) = 24e6 / 24 = 1,000,000 */
+#define LPUART3_BAUD_1MBPS     ((23U << 24) | 1U)   /* 0x17000001 */
 
 /* LPUART register offsets (NXP LPUART IP) */
 #define LPUART_BAUD_OFFSET   0x10U
@@ -52,32 +85,49 @@
 #define PING_SCAN_ID_MIN 1U
 #define PING_SCAN_ID_MAX 5U
 
-static const struct device *const ccm_dev =
-	DEVICE_DT_GET(DT_NODELABEL(ccm));
 static const struct device *const lpuart3_dev =
 	DEVICE_DT_GET(DT_NODELABEL(lpuart3));
 
 /* ===========================================================================
- * PRE_KERNEL_1 clock-root configuration (prio 0)
+ * PRE_KERNEL_1 prio 0: SDK-direct clock-tree bring-up.
+ *
+ * iMX93 reset state: every clock root has OFF bit set. Zephyr's
+ * clock_control_mcux_ccm_rev2.c only sets the LPCG IP gate; it does NOT
+ * clear the root OFF bit or set mux/div. Calling the SDK directly bypasses
+ * that gap and configures both Lpuart2 (console) and Lpuart3 (servo bus)
+ * for a 24 MHz functional clock sourced from Osc24M with div=1.
  * =========================================================================*/
 
-static int lpuart_clocks_init(void)
+static int imx93_m33_clock_init(void)
 {
-	int rc;
-
-	if (!device_is_ready(ccm_dev)) {
-		return -ENODEV;
-	}
-
-	rc = clock_control_on(ccm_dev,
-		(clock_control_subsys_t)IMX_CCM_LPUART3_CLK);
-	if (rc != 0) {
-		return rc;
-	}
-
+	const clock_root_config_t rootCfg = {
+		.clockOff = false,
+		.mux      = 0,
+		.div      = 1,
+	};
+	CLOCK_SetRootClock(kCLOCK_Root_Lpuart2, &rootCfg);
+	CLOCK_EnableClock(kCLOCK_Lpuart2);
+	CLOCK_SetRootClock(kCLOCK_Root_Lpuart3, &rootCfg);
+	CLOCK_EnableClock(kCLOCK_Lpuart3);
 	return 0;
 }
-SYS_INIT(lpuart_clocks_init, PRE_KERNEL_1, 0);
+SYS_INIT(imx93_m33_clock_init, PRE_KERNEL_1, 0);
+
+/* ===========================================================================
+ * PRE_KERNEL_1 prio 60: force LPUART3 BAUD to 1 Mbaud.
+ *
+ * Runs after the LPUART driver init (prio 50) has potentially written
+ * its own (OSR, SBR). We overwrite with the exact integer divisor that
+ * yields 1,000,000 baud at the 24 MHz Lpuart3 root: OSR=23, SBR=1.
+ * =========================================================================*/
+
+static int imx93_lpuart3_baud_fixup(void)
+{
+	*(volatile uint32_t *)(LPUART3_BASE_NS + LPUART_BAUD_OFFSET) =
+		LPUART3_BAUD_1MBPS;
+	return 0;
+}
+SYS_INIT(imx93_lpuart3_baud_fixup, PRE_KERNEL_1, 60);
 
 /* ===========================================================================
  * Helpers
@@ -167,12 +217,8 @@ static int print_boot_banner(void)
 		return -ENODEV;
 	}
 
-	if (!device_is_ready(ccm_dev)) {
-		printk("BOOT FAIL: ccm device not ready\n");
-		return -ENODEV;
-	}
-
-	/* Clock root prio 0 hook must have completed before main(). */
+	/* Clock root prio 0 hook (imx93_m33_clock_init) must have run before
+	 * main(). After the prio 60 baud_fixup hook, BAUD should be 0x17000001. */
 	if (baud == 0U) {
 		printk("BOOT FAIL: LPUART3 BAUD=0 (clock root not configured)\n");
 		return -ENODEV;

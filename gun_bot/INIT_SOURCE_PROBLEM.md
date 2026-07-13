@@ -69,22 +69,35 @@ because the A55 has it.
 
 ### 2.3 Any M33 firmware crashes the SoC
 
-**Root cause:** a no-touch firmware (a bare `int main(void) { printk(...); return 0; }`)
-leaves the M33 in an unclocked-but-bus-active state. Every LPUART clock
-root comes out of POR with the OFF bit set; without an explicit
-`CLOCK_SetRootClock()` call, the LPUART driver binds but any TX write
-hangs on TDRE. Worse, if any peripheral is touched before its clock
-root is opened, the resulting bus transaction crosses into the A55
-domain and the SoC watchdog eventually trips.
+**Root cause:** Zephyr's i.MX93 M33 soc port only zeroes DTCM and clears
+a sleep-hold bit; it does **not** open clock roots. Worse, the Zephyr
+clock driver `clock_control_mcux_ccm_rev2.c` in this fork has a **gap**:
 
-This is **not** a SDK or Zephyr bug — Zephyr's i.MX93 M33 soc port only
-zeroes DTCM and clears a sleep-hold bit; it does **not** open clock
-roots. The fork has the right clock-root cases (`IMX_CCM_LPUART{1..8}_CLK`)
-in `clock_control_mcux_ccm_rev2.c` but they only fire when
-`clock_control_on(ccm_dev, IMX_CCM_LPUARTn_CLK)` is called from
-somewhere — typically a `SYS_INIT(PRE_KERNEL_1, prio 0)` hook in the
-application. No such hook → no clock root → undefined peripheral
-behaviour → SoC crash.
+- Its `DEVICE_API` struct does **not** declare a `.configure` member
+  (`mcux_ccm_driver_api` only has `.on / .off / .get_rate / .set_rate`).
+- The `mcux_ccm_on()` handler for `IMX_CCM_LPUART{1..8}_CLK` only
+  calls `CLOCK_EnableClock(...)` (the LPCG IP gate) — it does **not**
+  call `CLOCK_SetRootClock(...)` to clear the root's OFF bit or set
+  mux/div.
+- The LPUART driver's own init calls `clock_control_configure()`,
+  gets `-ENOSYS` (because no `.configure`), then proceeds to
+  `clock_control_on()` — which also only enables the IP gate.
+
+Net effect: the LPUART clock **root** never comes up. On i.MX93, every
+clock root's `CLOCK_ROOT_CONTROL.RW` defaults to OFF after POR; without
+`CLOCK_SetRootClock(root, ...)` clearing that OFF bit and configuring
+mux/div, the LPUART peripheral cannot clock its TX path. Any
+`uart_poll_out()` therefore hangs on TDRE forever. The bus transaction
+crosses into the A55 domain and the SoC watchdog trips — wifi drops
+within seconds of `echo start` on the A55 Linux side.
+
+This was diagnosed 2026-07-13 by comparing the broken mobturret
+firmware against the working reference at
+`~/Desktop/physical_gunbound/gun_bot/m33_firmware/gun_controller/`
+(which uses SDK `CLOCK_SetRootClock` + `CLOCK_EnableClock` directly,
+bypassing the Zephyr clock API entirely). The mobturret firmware had
+the canonical Zephyr-side hook — but Zephyr's own clock driver is
+incomplete, so the hook was effectively a no-op.
 
 ### 2.4 NXP-downstream `fsl_lpuart.c` is broken from accumulated edits
 
@@ -161,29 +174,90 @@ Long-term, switch to RPMSG log forwarding
 (`CONFIG_LOG_BACKEND_RPMSG=y` → read from `/dev/ttyRPMSG0`) — that's
 clean and avoids the shared UART entirely.
 
-### 3.3 The clock-root SYS_INIT hook (problem 2.3)
+### 3.3 The clock-root SYS_INIT hooks (problem 2.3)
 
-The application **must** include this hook at `PRE_KERNEL_1 prio 0`:
+The application **must** include **two** SYS_INIT hooks. Both run at
+`PRE_KERNEL_1` and bypass Zephyr's incomplete `clock_control` API by
+calling the SDK clock functions directly.
+
+**Hook 1 — `PRE_KERNEL_1 prio 0`: clock root + IP gate bring-up.**
+
+Runs before any LPUART driver init (prio 50). Calls the SDK's
+`CLOCK_SetRootClock()` (which clears the OFF bit and writes mux/div)
+followed by `CLOCK_EnableClock()` (which sets the LPCG IP gate), for
+**both** Lpuart2 (console) and Lpuart3 (servo bus):
 
 ```c
-static int lpuart_clocks_init(void)
+#include <fsl_clock.h>
+
+static int imx93_m33_clock_init(void)
 {
-    clock_control_on(ccm_dev,
-        (clock_control_subsys_t)IMX_CCM_LPUART3_CLK);
+    const clock_root_config_t rootCfg = {
+        .clockOff = false,
+        .mux      = 0,    /* Osc24M */
+        .div      = 1,
+    };
+    CLOCK_SetRootClock(kCLOCK_Root_Lpuart2, &rootCfg);
+    CLOCK_EnableClock(kCLOCK_Lpuart2);
+    CLOCK_SetRootClock(kCLOCK_Root_Lpuart3, &rootCfg);
+    CLOCK_EnableClock(kCLOCK_Lpuart3);
     return 0;
 }
-SYS_INIT(lpuart_clocks_init, PRE_KERNEL_1, 0);
+SYS_INIT(imx93_m33_clock_init, PRE_KERNEL_1, 0);
 ```
 
-This opens the LPUART3 clock root + IP gate. LPUART2's clock root is
-opened separately when Zephyr's `mcux_lpuart` driver binds it at
-`CONFIG_SERIAL_INIT_PRIORITY = 50`.
+The SDK `fsl_clock.c` is linked into the build by
+`nxp_zephyr/modules/hal_nxp/mcux/mcux-sdk/CMakeLists.txt:56`
+(`zephyr_library_sources(.../fsl_clock.c)` for `MCUX_DEVICE_PATH`).
+The `fsl_clock.h` header lives at
+`modules/hal/nxp/mcux/mcux-sdk/devices/MIMX9352/drivers/fsl_clock.h`.
 
-Any firmware lacking this hook **will crash the SoC**. The hook
-must run *before* the LPUART driver (`prio 0 < 50`). See
-[`m33_firmware/gun_controller/src/main.cpp`](m33_firmware/gun_controller/src/main.cpp)
-for the full pattern (clock_init → mcux_lpuart binds → SDK
-LPUART_Init runs with the baud-override patch → BAUD = 0x17000001).
+**Hook 2 — `PRE_KERNEL_1 prio 60`: LPUART3 BAUD fixup.**
+
+Runs after the LPUART driver init (prio 50). Forces
+`BAUD = 0x17000001` (OSR=23, SBR=1, the integer divisor for 1,000,000
+baud at the 24 MHz Lpuart3 root), regardless of whatever (OSR, SBR) the
+SDK's baud-search loop in `LPUART_Init()` produced:
+
+```c
+#define LPUART3_BASE_NS        0x42570000UL
+#define LPUART3_BAUD_1MBPS     ((23U << 24) | 1U)   /* 0x17000001 */
+
+static int imx93_lpuart3_baud_fixup(void)
+{
+    *(volatile uint32_t *)(LPUART3_BASE_NS + 0x10U) = LPUART3_BAUD_1MBPS;
+    return 0;
+}
+SYS_INIT(imx93_lpuart3_baud_fixup, PRE_KERNEL_1, 60);
+```
+
+**Why not use Zephyr's `clock_control_on()` instead of SDK directly?**
+
+Zephyr's clock driver in this fork has no `.configure` member; its
+`mcux_ccm_on()` handler only calls `CLOCK_EnableClock()` (IP gate) and
+never `CLOCK_SetRootClock()`. So `clock_control_on(...)` only enables
+the IP gate and leaves the clock root's OFF bit set — the LPUART TX
+still hangs on TDRE. Going through the SDK bypasses the gap and is the
+canonical working pattern (matches the reference firmware at
+`~/Desktop/physical_gunbound/...`).
+
+**Anti-patterns to avoid (proven to crash):**
+
+- Calling only `clock_control_on(ccm_dev, IMX_CCM_LPUART3_CLK)` — IP
+  gate comes up, root stays OFF → TX hangs → SoC crash.
+- Hook that returns early on `!device_is_ready(ccm_dev)` — at
+  `PRE_KERNEL_1 prio 0`, the ccm_rev2 driver hasn't init'd yet
+  (`CONFIG_CLOCK_CONTROL_INIT_PRIORITY=30` runs later), so the check
+  fails and the hook no-ops. Same end result as no hook at all.
+- Relying solely on the `LPUART_Init()` baud override in the
+  `ltdat1095/hal_nxp` fork — the override only fires when `LPUART_Init`
+  is actually called, which it never is if the peripheral is
+  clock-starved at bind time.
+
+**Verification:** the deployed firmware (`zephyr_recover_v3.elf`, md5
+`3887df3bcf8ae5cafba032d11fc02607`) holds wifi up at 0% loss for
+60+ s on the FRDM — no SoC crash signal. A55 uptime confirmed at
+17 min post-deploy with M33 `state=running`.
 
 ### 3.4 The fork migration (problem 2.4)
 
