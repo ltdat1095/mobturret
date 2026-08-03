@@ -1,0 +1,4 @@
+# Placeholder so the docker volume mount path exists on a fresh clone.
+# The Go server reads from / writes to DynamoDB Local over the network
+# (host port 8181 -> container port 8000) — this dir is just where
+# DynamoDB Local persists tables across container restarts.

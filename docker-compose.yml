@@ -1,0 +1,29 @@
+# MobTurret local dev — DynamoDB Local only.
+# Server runs on host via `make run` for fast iteration.
+# Why host-side: docker rebuild cycles are slower than `go run`.
+#
+# Usage:
+#   docker compose up -d dynamodb
+#   cd server && make run
+#   curl http://localhost:8080/healthz
+#
+# Note: amazon/dynamodb-local is JRE-only (no curl), so no healthcheck.
+# The Go server retries DDB calls with backoff on first connect.
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:3.3.0
+    container_name: mobturret-dynamodb
+    command:
+      - "-jar"
+      - "DynamoDBLocal.jar"
+      - "-sharedDb"
+      - "-dbPath"
+      - "/home/dynamodblocal/data"
+      - "-cors"
+      - "*"
+    ports:
+      - "8181:8000"
+    volumes:
+      - ./docker/dynamoDB:/home/dynamodblocal/data
+    restart: unless-stopped

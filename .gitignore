@@ -79,7 +79,7 @@ gun_bot/m33_firmware/.west/
 **/CMakeCache.txt
 **/CMakeFiles/
 **/cmake_install.cmake
-**/Makefile
+**/Makefile.local
 **/compile_commands.json
 # Generic C/C++ object outputs
 **/*.o
@@ -173,3 +173,20 @@ $RECYCLE.BIN/
 secrets/
 credentials.json
 service-account*.json
+
+
+# ----------------------------------------------------------------------------
+# F. Local dev artifacts (stateful, not part of the repo)
+# ----------------------------------------------------------------------------
+#
+# DynamoDB Local's embedded SQLite database — rebuilt on every
+# `docker compose up`. Mounting it under the repo keeps the volume
+# across container restarts, but committing it would put a writeable
+# runtime artifact under version control.
+docker/dynamoDB/shared-local-instance.db
+
+# Local Claude settings (per-machine, contains personal preferences).
+.claude/settings.local.json
+
+# Screenshots captured during emulator debugging sessions.
+screenshots/
