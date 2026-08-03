@@ -6,7 +6,7 @@ real hardware), even if later features are stubbed.
 
 | Phase | Theme | Status |
 |---|---|---|
-| **1** | Local development — server + DynamoDB Local + ROS2 on A55 + Flutter | **In progress** |
+| **1** | Local development — server + DynamoDB Local + ROS2 on A55 + Flutter | **In progress** — M1, M2, M6, M3 stub, M7 stub done; signup→login→dashboard→relaunch circle verified on Android 16 emulator (2026-08-03); Android 16 floating-IME-toolbar fix shipped (any new TextField should reuse the `contextMenuBuilder` override) |
 | 2 | AWS wiring — replace local stubs with real AWS services | Planned |
 | 3 | Real-time manual mode — direct TCP/WS, RTSP video, virtual joystick | Planned |
 | 4 | Computer vision — YOLOv8 on the A55 NPU, depth fusion, auto-detect loop | Planned |
@@ -92,12 +92,15 @@ the milestone is verified end-to-end, not when the code is written.
 
 #### M1 — Local dev environment
 
-- [ ] `docker-compose.yml` at repo root: DynamoDB Local on **port 8181** (no admin UI)
-- [ ] Go module under `server/cmd/server` — **Gin** HTTP framework,
-      **Viper** for config (`.env`), **Zap** for logging, **Wire**
-      for DI, **`gin-contrib/cors`** for CORS, **`google/uuid`** for
-      user_id + request_id (full module layout + locked deps in
-      `server/CLAUDE.md`)
+- [x] `docker-compose.yml` at repo root: DynamoDB Local on **port 8181** (no admin UI)
+- [x] Go module under `server/cmd/server` — **Gin** HTTP framework,
+      **Viper** for config (`.env`), **`log/slog`** (stdlib, not Zap)
+      for logging, manual DI for now (Wire deferred — single-module
+      MVP), **`gin-contrib/cors`** for CORS, **`google/uuid`** for
+      user_id + request_id (full module layout in
+      `server/internal/platform/` — one package per concern:
+      `config`, `database`, `logger`, `middleware`, `response`,
+      `security`)
 - [ ] Empty ROS2 workspace at `ros2_ws/` with two package skeletons:
       `gun_controller`, `cloud_bridge` (target: **ROS2 Humble
       Hawksbill** on Ubuntu 22.04)
@@ -105,8 +108,10 @@ the milestone is verified end-to-end, not when the code is written.
       sibling Yocto build for the FRDM-iMX93 A55 image; cross-compile
       ROS2 nodes against it; deploy to FRDM via SSH (see
       [`gun_bot_controller/CLAUDE.md`](./gun_bot_controller/CLAUDE.md))
-- [ ] `gun_bot_mobile/` initialized with `flutter create` and
-      feature-first layout (`lib/features/{auth,dashboard,control,gallery}`)
+- [x] `gun_bot_mobile/` initialized with `flutter create` and
+      feature-first layout (`lib/features/{auth,…}`) — Flutter SDK
+      3.44.8 installed at `C:\src\flutter`; feature-first layout
+      with auth wired up; only the auth slice is built (M6)
 - [ ] Each subproject's `CLAUDE.md` updated with setup steps for
       Phase 1 (separate from the MobTurret-overview CLAUDE.md)
 
@@ -115,25 +120,45 @@ the milestone is verified end-to-end, not when the code is written.
 `/healthz` 200 OK, and `flutter run` builds the mobile app on the
 emulator.
 
+**M1 status (2026-07-31):** Docker + Go + Flutter stacks are up;
+server scaffolds pass `make verify`; mobile app analyzes clean. ROS2
+toolchain and FRDM cross-compile land with M4–M5 (the on-robot
+pilars, separate work stream).
+
 #### M2 — Local server: auth
 
-- [ ] `Users` DynamoDB table (schema per `design.md` §5.1.1)
-- [ ] `POST /auth/signup` — create user (bcrypt-hashed password)
-- [ ] `POST /auth/login` — issue **HS256** JWT (24 h TTL) with shared
-      secret from `JWT_SIGNING_KEY` env var
-- [ ] `GET /auth/me` — verify middleware reads JWT
-- [ ] Unit tests against DynamoDB Local container
+- [x] `Users` DynamoDB table — PK `user_id`, plus a sentinel
+      `EMAIL#<email_key>` row written in the same
+      `TransactWriteItems` so email uniqueness is race-free without
+      a GSI (schema matches `design.md` §5.1.1 plus the sentinel)
+- [x] `POST /auth/signup` — bcrypt-hashed password (DefaultCost=10)
+- [x] `POST /auth/login` — issue **HS256** JWT (24 h TTL) with
+      shared secret from `JWT_SECRET_KEY` env var
+- [x] `GET /auth/me` — verify middleware reads JWT
+- [x] Unit + integration tests against DynamoDB Local
+      (`go test ./...` is green; DDB tests default to
+      `http://localhost:8181` and skip if it's down)
 
 **Done when:** `curl POST /auth/signup` → 201, `curl POST /auth/login`
 → 200 + token, `curl GET /auth/me` with token → 200, without token →
 401. All in CI.
 
+**M2 status (2026-07-31):** Verified end-to-end on Windows via
+`make verify` equivalent. Includes typed sentinel errors
+(`entity.ErrEmailAlreadyExists`, `ErrUserNotFound`,
+`ErrInvalidCredentials`), idempotent `EnsureTablesExist`, graceful
+shutdown on SIGINT/SIGTERM, and a `request_id` middleware that
+echoes the caller-supplied `X-Request-Id` (or generates a uuid) and
+threads it through `slog` for log correlation.
+
 #### M3 — Local server: robot state + registration
 
+- [x] `GET /turrets` — list robots owned by the current user
+      *(stub returns `[]`; full implementation is M3 proper — see
+      "M3 stub" notes below)*
 - [ ] `Turrets` DynamoDB table (schema per `design.md` §5.1.2)
 - [ ] `POST /turrets` — admin endpoint to register a robot
       (owner_id, robot_id)
-- [ ] `GET /turrets` — list robots owned by the current user
 - [ ] `GET /turrets/{id}` — single-robot state (online/offline,
       mode, last telemetry, last_seen)
 - [ ] `POST /turrets/{id}/state` — `cloud_bridge` pushes state
@@ -145,8 +170,18 @@ emulator.
 - [ ] `Commands` DynamoDB table (PK: `robot_id`, SK: `seq`) — backs
       the polling endpoint
 
-**Done when:** seed script registers a robot, `cloud_bridge` (or a
-test stub) can `POST` state and `GET` commands, the values round-trip.
+**M3 stub (2026-08-03):** `GET /turrets` is wired and protected
+by the M2 JWT middleware; the usecase returns an empty list, never
+`nil`, so the wire format is `{"data":{"turrets":[]}}` (verified
+with `make verify` + the dedicated `scripts/smoke-turrets.sh`).
+No DDB table is created yet — `EnsureTablesExist` is unchanged.
+M3 proper (Turrets DDB table, register endpoint, state ingest,
+commands table, GSI on `owner_id`) is deferred until the A55
+ROS2 stack (M4/M5) is in place to actually publish state.
+
+**Done when (M3 proper):** seed script registers a robot,
+`cloud_bridge` (or a test stub) can `POST` state and `GET`
+commands, the values round-trip.
 
 #### M4 — `gun_controller` ROS2 node
 
@@ -199,33 +234,71 @@ state change propagate to the server.
 
 #### M6 — Mobile app: auth
 
-- [ ] Login screen (`email` + `password`)
-- [ ] Signup screen
-- [ ] `dio` HTTP client + auth interceptor (attach JWT)
-- [ ] JWT stored in `flutter_secure_storage`
-- [ ] **Riverpod 2.x** providers for auth state, API client,
-      base URL (overridable via `--dart-define`)
-- [ ] Auto-logout on 401; manual logout in settings
-- [ ] Base URL configurable (defaults to `http://10.0.2.2:8080` on
+- [x] Login screen (`email` + `password`)
+- [x] Signup screen
+- [x] `dio` HTTP client + auth interceptor (attach JWT)
+- [x] JWT stored in `flutter_secure_storage` (Android:
+      EncryptedSharedPreferences; iOS: Keychain
+      `first_unlock_this_device`)
+- [x] **Riverpod 2.x** providers for auth state, API client,
+      base URL (overridable via `--dart-define=API_BASE_URL=…`)
+- [x] Auto-logout on 401; manual logout in settings (logout
+      `IconButton` on the placeholder home screen; settings page
+      lands with M7)
+- [x] Base URL configurable (defaults to `http://10.0.2.2:8080` on
       Android emulator for dev — points to host's localhost)
+- [x] Emulator round-trip verification (cold-boot in progress)
 
 **Done when:** signup on the emulator → app stores token → killing
 the app and relaunching shows the user still logged in.
 
+**M6 status (2026-07-31):** Code complete — `flutter analyze` is
+clean (5.4 s, 0 errors, 0 warnings). Layout:
+`lib/core/{config,secure_jwt_storage,dio_client,router}.dart` +
+`lib/features/auth/{data,domain,application,presentation}/`. Awaiting
+emulator boot + interactive verification of the signup → token
+storage → relaunch → logout loop.
+
+**M6 status (2026-08-03):** Round-trip verified on Android 16
+emulator (`mobturret_avd`): signup → token stored in secure storage
+→ kill + relaunch → `/auth/me` 200 → dashboard → logout → `/login`.
+Server port now **8182** (8080 was held by another project on dev
+machine); `lib/core/config.dart` `kApiBaseUrl` updated to match.
+Android 16 / Material 3 quirk: `TextField` was showing a floating
+selection toolbar over the IME that hid the QWERTY keyboard. Fixed
+in `login_screen.dart` + `signup_screen.dart` by setting
+`contextMenuBuilder: (c, s) => const SizedBox.shrink()` on every
+`TextFormField` — the field stays editable, the magnifier / cut-copy
+handle is gone. Any new `TextField` should inherit the same override
+(extract a `MobTextField` wrapper when a third file needs it).
+
 #### M7 — Mobile app: robot state
 
-- [ ] Dashboard: list owned robots (live status dot + last seen)
+- [x] Dashboard skeleton: list owned robots (empty state, no
+      polling yet — see "M7 stub" notes below)
+- [ ] Dashboard: full list with live status dot + last seen
 - [ ] Robot detail page: state, mode, telemetry (battery, temp,
       servo positions)
 - [ ] Mode toggle (`MANUAL` / `AUTO` / `SAFE`) — issues a command
       via the server
 - [ ] Pull-to-refresh + 1 s background polling for live state
-- [ ] Empty / loading / error states
+- [ ] Empty / loading / error states *(loading + error wired;
+      empty state wired against the M3 stub)*
 
-**Done when:** on the emulator, see the FRDM robot appear on the
-dashboard within 1 s of `cloud_bridge` starting, mode toggle takes
-effect at the robot within ~500 ms (round-trip = 200 ms poll +
-processing).
+**M7 stub (2026-08-03):** Dashboard screen, `TurretsNotifier`
+(`AsyncNotifier<List<Turret>>`), `TurretsRepository`, and
+`TurretCard` widget are in place. Renders the "No robots yet"
+empty state against the M3 stub (`GET /turrets → []`). Self-building
+provider wiring (no more `ProviderScope` overrides) fixes a
+pre-existing Riverpod 2.x quirk where nested overrides weren't
+visible to `authRepositoryProvider`. `flutter analyze` 0 errors;
+9 model-layer unit tests pass (`test/domain_models_test.dart`).
+Interactive verification on the Android emulator is the next step.
+
+**Done when (M7 proper):** on the emulator, see the FRDM robot
+appear on the dashboard within 1 s of `cloud_bridge` starting,
+mode toggle takes effect at the robot within ~500 ms (round-trip =
+200 ms poll + processing).
 
 #### M8 — End-to-end local integration
 
