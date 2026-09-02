@@ -1,20 +1,78 @@
 /*
- * LPUART3 overlay for FRDM-iMX93 M33 core.
- *
- * Pure-Zephyr path: the LPUART3 node from the fork's
- * nxp_imx93_m33.dtsi (disabled by default) is enabled here, bound to
- * the mcux_lpuart driver, and routed through uart3_default pinctrl
- * (GPIO_IO14 -> LPUART3_TX, GPIO_IO15 -> LPUART3_RX). main.cpp drives
- * the bus via Zephyr's uart_poll_in / uart_poll_out against this node.
- *
- * Two-pin mode with external short (TX ↔ RX) on GPIO_14/GPIO_15 for
- * loopback bring-up.
+ * v22: add back the proper overlay (MU1 fix, ipc0_mbox, shmem,
+ * rsc_table, chosen) AND add MPU regions to grant the M33 access
+ * to the A55-DRAM addresses used for vdev0vrings and the
+ * resource table. Without these MPU regions, the M33's
+ * `memcpy(0x2021e000, ...)` in rsc_table_get() faults because
+ * `0x2021e000` is outside the M33's default MPU regions.
  */
 
 /* SPDX-License-Identifier: Apache-2.0 */
+
+/* LPUART3 — servo bus */
 &lpuart3 {
 	status = "okay";
 	current-speed = <1000000>;
 	pinctrl-0 = <&uart3_default>;
 	pinctrl-names = "default";
+};
+
+/* MU1 — override the dtsi address to match the A55 DTB */
+&mu1 {
+	reg = <0x44230000 DT_SIZE_K(4)>;
+	status = "okay";
+};
+
+/* MPU regions: allow the M33 to access the A55-DRAM addresses
+ * used by the RPMsg link. Without these, the memcpy in
+ * rsc_table_get() faults and wedges the printk backend.
+ *
+ * The mpu@e000ed90 inherits #address-cells=2, #size-cells=1
+ * from somewhere in the chain (the DTS compiler reports 2
+ * for #address-cells). reg = <addr_hi addr_lo size>. */
+&mpu {
+	/* vdev0vrings (A55 DTB: vdev0vring0@a4000000,
+	 * vdev0vring1@a4008000) — 64 KB at 0xa4000000. */
+	mpu_region_a4000000: mpu-region@a4000000 {
+		compatible = "arm,armv8m-mpu-region";
+		reg = <0x0 0xa4000000 0x10000>;
+		region = <0xa4000000 0x10000>;
+		attr = <0x9U 0x6U>;
+	};
+
+	/* rsc-table (0x2021e000) — 1 MB at 0x20200000. */
+	mpu_region_20200000: mpu-region@20200000 {
+		compatible = "arm,armv8m-mpu-region";
+		reg = <0x0 0x20200000 0x100000>;
+		region = <0x20200000 0x100000>;
+		attr = <0x9U 0x6U>;
+	};
+};
+
+&{/} {
+	/* IPM device on MU1 channel 0 (tx) / 1 (rx) */
+	ipc0_mbox: mailbox {
+		compatible = "zephyr,mbox-ipm";
+		mboxes = <&mu1 0>, <&mu1 1>;
+		mbox-names = "tx", "rx";
+		status = "okay";
+	};
+
+	/* shmem — A55 DTB vdevbuffer@a4020000 (1 MB) */
+	shmem: ipc_shm@a4020000 {
+		compatible = "mmio-sram";
+		reg = <0xa4020000 0x100000>;
+	};
+
+	/* rsc-table — A55 DTB rsc-table@2021e000 (4 KB) */
+	rsc_table: ipc_rsc_table@2021e000 {
+		compatible = "mmio-sram";
+		reg = <0x2021e000 0x1000>;
+	};
+
+	chosen {
+		zephyr,ipc           = &ipc0_mbox;
+		zephyr,ipc_shm       = &shmem;
+		zephyr,ipc_rsc_table = &rsc_table;
+	};
 };

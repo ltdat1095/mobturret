@@ -15,6 +15,16 @@ Documentation map:
   from a crash. **Read this if you want to run on the board.**
 - [`./m33_firmware/BUILD_SYSTEM.md`](./m33_firmware/BUILD_SYSTEM.md) — how
   to build and deploy the firmware. **Read this if you want to build.**
+- [`./IPC.md`](./IPC.md) — M33-side mirror of the wire format
+  (canonical at [`../IPC.md`](../IPC.md)). The handler map: which
+  inbound messages the M33 implements and which outbound messages it
+  emits.
+- [`./RPMSG.md`](./RPMSG.md) — **the M33-side transport implementation
+  of the inter-core link** (resource table, MU1 mailbox client,
+  Zephyr Kconfig, address map reconciled with the A55 DTB). Read
+  this before adding RPMsg to the M33 firmware. [`../IPC.md`](../IPC.md)
+  is the wire format; this is what makes the M33 actually publish
+  the endpoints.
 - [`./SERVO_SETUP.md`](./SERVO_SETUP.md) — SC15 servo bus bring-up
   record, SCSCL wire protocol, wheel-mode direction control, and the
   **§0 motion safety envelope**. Read §0 before commanding any motion.
@@ -22,6 +32,16 @@ Documentation map:
   initial-step problems (LPUART3 baud, missing printk, SoC crash,
   broken SDK file, SDK auto-selection), their root causes, and the
   fixes that produced the working recipe. Read this for context.
+- [`./RPMSG_BISECT_20260902.md`](./RPMSG_BISECT_20260902.md) —
+  the 17-iteration v1–v17 bisect that got the link half-up.
+  A55 side works; M33 side has an unidentified LPUART2 console
+  wedge.
+- [`./RPMSG_BISECT_20260903.md`](./RPMSG_BISECT_20260903.md) —
+  the v18–v33 bisect pass. Identifies the v22 "LPUART2 alive"
+  result as a stale-buffer false positive, explains why the DT
+  MPU child regions don't apply at runtime, and documents the
+  ARMv8-M RLAR EN-bit layout. Read this **before** continuing
+  the RPMSG port.
 
 ---
 
@@ -97,7 +117,8 @@ in [`./INIT_SOURCE_PROBLEM.md`](./INIT_SOURCE_PROBLEM.md) § 2.1 and
 | `m33_firmware/gun_controller/mcux_include.json` | `ZEPHYR_BASE` and `ZEPHYR_SDK_INSTALL_DIR` env. (The SDK 0.17.4 value declared here is overridden by CMake auto-selection of SDK 1.0.1 — see [`./INIT_SOURCE_PROBLEM.md`](./INIT_SOURCE_PROBLEM.md) § 3.5.) |
 | `m33_firmware/nxp_zephyr/` | Git submodule → user's MobTurret zephyr fork at `mobturret/m33-lpuart3-clock-and-overlay`. Contains the LPUART3 dtsi, the `IMX_CCM_LPUART{1..8}_CLK` clock cases, and `west.yml` pinning hal_nxp. |
 | `m33_firmware/{modules,bootloader,tools,.west}/` | West workspace output. Populated by `west update`. All in `.gitignore`. The critical entry is `modules/hal/nxp` at `c7f1b8449` (the MobTurret 1 Mbaud SDK patch). |
-| `./IPC.md` | The A55 ↔ M33 wire contract. The main artifact of this subproject. |
+| `./IPC.md` | The A55 ↔ M33 wire contract (M33-side mirror). The main artifact of this subproject. |
+| `./RPMSG.md` | M33-side transport implementation: resource table, MU1 client, Zephyr Kconfig, A55 DTB address map. |
 | `./HOW_TO_DEBUG.md` | Operational playbook: deploy to hardware, monitor, debug, recover. |
 | `./SERVO_SETUP.md` | SC15 bus bring-up, SCSCL protocol, motion safety envelope (§0). |
 | `./INIT_SOURCE_PROBLEM.md` | Initial-step archaeology (root causes and fixes). |

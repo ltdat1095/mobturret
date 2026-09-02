@@ -22,8 +22,15 @@ communication.
   over RTSP / RTP / UDP.
 - **Inter-core IPC.** Send `MSG_SET_TARGET`, `MSG_FIRE`, `MSG_MODE`,
   etc. to the M33 over RPMsg and consume `MSG_TELEMETRY`,
-  `MSG_ALERT`, `MSG_SERVO_DIAG` back. **Wire contract: [`../IPC.md`](../IPC.md),
-  mirrored at [`./IPC.md`](./IPC.md).**
+  `MSG_ALERT`, `MSG_SERVO_DIAG` back. **Wire contract:
+  [`../IPC.md`](../IPC.md)** (canonical), mirrored at
+  [`./IPC.md`](./IPC.md) (A55-side handler map).
+  **Transport implementation: [`./RPMSG.md`](./RPMSG.md)** — the
+  A55-side guide to the i.MX93 RPMsg/OpenAMP plumbing (remoteproc
+  boot, `rpmsg_char` / `/dev/rpmsg*`, endpoint names, pitfalls).
+  The M33 side is at [`../gun_bot/RPMSG.md`](../gun_bot/RPMSG.md).
+  Wire format and transport are split into two docs so a wire-format
+  change never has to touch the transport doc, and vice versa.
 
 ## Planned layout (not yet committed)
 
@@ -119,10 +126,28 @@ ssh root@imx93frdm 'systemctl restart gun_controller.service'
   local MQTT. Defer to M5.
 - **Local auth for the Manual-mode TCP socket (mTLS vs PSK)** —
   Phase 3.
+- **RPMsg endpoint names** — proposed in [`./RPMSG.md`](./RPMSG.md)
+  §3.1 as `turret-ctrl` (host→remote) and `turret-telemetry`
+  (remote→host). Promote these to the canonical
+  [`../IPC.md`](../IPC.md) §Transport so the wire doc stops being
+  silent on the topic.
 
 ## Related docs
 
 - [`../CLAUDE.md`](../CLAUDE.md) — MobTurret root
 - [`../IPC.md`](../IPC.md) — A55 ↔ M33 wire contract (canonical)
 - [`./IPC.md`](./IPC.md) — A55-side mirror with implementation notes
+  (handler map: which messages the A55 emits in response to cloud /
+  mobile input)
+- [`./RPMSG.md`](./RPMSG.md) — **A55-side transport implementation of
+  the inter-core link** (remoteproc boot, `rpmsg_char` /
+  `/dev/rpmsg*` usage, endpoint names, liveness, pitfalls). Read
+  this before writing any A55 IPC client. [`../IPC.md`](../IPC.md) is
+  the wire format; this is what makes the A55 actually open the
+  endpoints.
+- [`../gun_bot/RPMSG.md`](../gun_bot/RPMSG.md) — the M33 side of the
+  same link (resource table, MU1 client, Zephyr Kconfig). The two
+  RPMSG docs together are the "how to make the link work" pair.
+- [`../gun_bot/HOW_TO_DEBUG.md`](../gun_bot/HOW_TO_DEBUG.md) — the
+  deploy + console-capture playbook (used by both sides)
 - [`../design.md`](../design.md) — full architecture

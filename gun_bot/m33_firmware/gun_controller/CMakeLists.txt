@@ -5,6 +5,7 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(threads)
 
 target_sources(app PRIVATE src/main.cpp
+                         PRIVATE src/rpmsg_hello.c
                          PRIVATE src/servo/SCS.cpp
                          PRIVATE src/servo/SCSerial.cpp
                          PRIVATE src/servo/SCSCL.cpp)
